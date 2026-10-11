@@ -1,53 +1,54 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+    <!--
+      Source for BetterSpire2 Lite v1.83.10, recovered by decompiling the released
+      BetterSpire2Lite.dll (Steam Workshop item 3747531469) with ILSpy and fixing the
+      decompiler artifacts until it compiles. Only the Lite build is represented.
+    -->
     <PropertyGroup>
         <OutputType>Library</OutputType>
         <RootNamespace>BetterSpire2</RootNamespace>
+        <AssemblyName>BetterSpire2Lite</AssemblyName>
         <TargetFramework>net9.0</TargetFramework>
-        <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>enable</Nullable>
-        <Configurations>Full;Lite</Configurations>
+        <LangVersion>12.0</LangVersion>
+        <ImplicitUsings>disable</ImplicitUsings>
+        <Nullable>annotations</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <Configuration Condition="'$(Configuration)' == ''">Lite</Configuration>
+        <Configurations>Lite</Configurations>
+        <DefineConstants>$(DefineConstants);LITE_BUILD</DefineConstants>
+        <NoWarn>$(NoWarn);CS8632;CS0618;CS0162</NoWarn>
 
         <!-- Set this to your Slay the Spire 2 install directory -->
-        <Sts2Dir>G:\STEAM\Install\steamapps\common\Slay the Spire 2</Sts2Dir>
-    </PropertyGroup>
-
-    <PropertyGroup Condition="'$(Configuration)' == 'Full'">
-        <AssemblyName>BetterSpire2</AssemblyName>
-        <DefineConstants>FULL_BUILD</DefineConstants>
-    </PropertyGroup>
-
-    <PropertyGroup Condition="'$(Configuration)' == 'Lite'">
-        <AssemblyName>BetterSpire2Lite</AssemblyName>
-        <DefineConstants>LITE_BUILD</DefineConstants>
+        <Sts2Dir>C:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2</Sts2Dir>
+        <Sts2Data>$(Sts2Dir)\data_sts2_windows_x86_64</Sts2Data>
     </PropertyGroup>
 
     <ItemGroup>
         <Reference Include="sts2">
-            <HintPath>$(Sts2Dir)\data_sts2_windows_x86_64\sts2.dll</HintPath>
+            <HintPath>$(Sts2Data)\sts2.dll</HintPath>
+            <Private>false</Private>
+        </Reference>
+        <Reference Include="GodotSharp">
+            <HintPath>$(Sts2Data)\GodotSharp.dll</HintPath>
+            <Private>false</Private>
+        </Reference>
+        <Reference Include="0Harmony">
+            <HintPath>$(Sts2Data)\0Harmony.dll</HintPath>
+            <Private>false</Private>
         </Reference>
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Include="GodotSharp" Version="4.4.0" />
-        <PackageReference Include="Lib.Harmony" Version="2.4.2" />
-        <PackageReference Include="MonoMod.Core" Version="1.2.3" />
-    </ItemGroup>
-
-    <ItemGroup>
-        <None Include="BetterSpire2.json" CopyToOutputDirectory="PreserveNewest" />
         <None Include="BetterSpire2Lite.json" CopyToOutputDirectory="PreserveNewest" />
+        <None Include="BetterSpire2_localization\**" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
     <!-- Auto-deploy to mods folder on build -->
     <Target Name="CopyToMods" AfterTargets="Build" Condition="Exists('$(Sts2Dir)\mods')">
-        <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(Sts2Dir)\mods\" />
-        <Copy Condition="'$(Configuration)' == 'Full'"
-              SourceFiles="$(ProjectDir)BetterSpire2.json"
-              DestinationFolder="$(Sts2Dir)\mods\" />
-        <Copy Condition="'$(Configuration)' == 'Lite'"
-              SourceFiles="$(ProjectDir)BetterSpire2Lite.json"
-              DestinationFolder="$(Sts2Dir)\mods\" />
+        <Copy SourceFiles="$(TargetPath);$(ProjectDir)BetterSpire2Lite.json" DestinationFolder="$(Sts2Dir)\mods\BetterSpire2Lite\" />
+        <Copy SourceFiles="@(None)" Condition="$([System.String]::Copy('%(None.Identity)').StartsWith('BetterSpire2_localization'))"
+              DestinationFiles="$(Sts2Dir)\mods\BetterSpire2Lite\%(None.Identity)" />
     </Target>
 
 </Project>

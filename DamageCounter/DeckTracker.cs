@@ -1,856 +1,2493 @@
-using Godot;
-using MegaCrit.Sts2.Core.Combat;
-using MegaCrit.Sts2.Core.Entities.Cards;
-using MegaCrit.Sts2.Core.Entities.Creatures;
-using MegaCrit.Sts2.Core.Entities.Players;
-using MegaCrit.Sts2.Core.HoverTips;
-using MegaCrit.Sts2.Core.Nodes;
-using MegaCrit.Sts2.Core.Nodes.HoverTips;
-using MegaCrit.Sts2.Core.Platform;
-using MegaCrit.Sts2.Core.Runs;
-using HarmonyLib;
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
+using Godot;
+using HarmonyLib;
+using MegaCrit.Sts2.Core.Combat;
+using MegaCrit.Sts2.Core.Combat.History;
+using MegaCrit.Sts2.Core.Entities.Cards;
+using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Nodes;
+using MegaCrit.Sts2.Core.Platform;
+using MegaCrit.Sts2.Core.Rooms;
+using MegaCrit.Sts2.Core.Runs;
+using Microsoft.CSharp.RuntimeBinder;
+using Binder = Microsoft.CSharp.RuntimeBinder.Binder;
 
 namespace BetterSpire2;
 
-/// <summary>
-/// F3 panel that shows every player's current hand during combat.
-/// Compact card thumbnails with native game tooltips on hover.
-/// Draggable title bar.
-/// </summary>
 public static class DeckTracker
 {
-    // Set > 0 to duplicate the local player's hand N times for testing layout.
-    public static int DebugDuplicatePlayers = 0;
-
-    private static CanvasLayer? _canvasLayer;
-    private static HandPanel? _panel;
-    private static bool _visible;
-    private static readonly List<PlayerHandSection> _sections = new();
-
-    // Pagination
-    private static int _currentPage;
-    private const int PlayersPerPage = 4;
-
-    // Persisted position across show/hide
-    private static Vector2? _savedPosition;
-
-    public static void Toggle()
-    {
-        if (_visible)
-            Hide();
-        else
-            Show();
-    }
-
-    public static void NextPage()
-    {
-        if (!_visible) return;
-        int totalPlayers = GetPlayerCount();
-        int maxPage = Math.Max(0, (totalPlayers - 1) / PlayersPerPage);
-        if (_currentPage < maxPage)
-        {
-            _currentPage++;
-            Refresh();
-        }
-    }
-
-    public static void PrevPage()
-    {
-        if (!_visible) return;
-        if (_currentPage > 0)
-        {
-            _currentPage--;
-            Refresh();
-        }
-    }
-
-    private static int GetPlayerCount()
-    {
-        var runState = Traverse.Create(RunManager.Instance).Property<RunState>("State").Value;
-        if (runState?.Players == null) return 0;
-        return DebugDuplicatePlayers > 0 ? DebugDuplicatePlayers : runState.Players.Count;
-    }
-
-    private static void Show()
-    {
-        if (!ModSettings.ShowTeammateHand) return;
-
-        var combat = CombatManager.Instance;
-        if (combat == null) return;
-        var combatState = combat.DebugOnlyGetState();
-        if (combatState == null) return;
-
-        var runState = Traverse.Create(RunManager.Instance).Property<RunState>("State").Value;
-        if (runState?.Players == null || runState.Players.Count == 0) return;
-
-        _currentPage = 0;
-        BuildUI(runState);
-    }
-
-    private static void Refresh()
-    {
-        // Save position before rebuild
-        if (_panel != null && GodotObject.IsInstanceValid(_panel))
-            _savedPosition = _panel.Position;
-
-        var runState = Traverse.Create(RunManager.Instance).Property<RunState>("State").Value;
-        if (runState?.Players == null) return;
-        CleanupUI();
-        BuildUI(runState);
-    }
-
-    private static void BuildUI(RunState runState)
-    {
-        if (_visible) CleanupUI();
-
-        var game = NGame.Instance;
-        if (game == null) return;
-
-        _canvasLayer = new CanvasLayer();
-        _canvasLayer.Layer = 10;
-        game.AddChild(_canvasLayer);
-
-        // Build player list (with debug duplication)
-        var players = new List<Player>();
-        if (DebugDuplicatePlayers > 0)
-        {
-            var localPlayer = runState.Players[0];
-            for (int i = 0; i < DebugDuplicatePlayers; i++)
-                players.Add(localPlayer);
-        }
-        else
-        {
-            players.AddRange(runState.Players);
-        }
-
-        int totalPlayers = players.Count;
-        int maxPage = Math.Max(0, (totalPlayers - 1) / PlayersPerPage);
-        _currentPage = Math.Min(_currentPage, maxPage);
-        int startIdx = _currentPage * PlayersPerPage;
-        int endIdx = Math.Min(startIdx + PlayersPerPage, totalPlayers);
-
-        _panel = new HandPanel();
-        _panel.ZIndex = 200;
-
-        var styleBox = new StyleBoxFlat();
-        styleBox.BgColor = new Color(0.1f, 0.1f, 0.15f, 0.95f);
-        styleBox.BorderColor = new Color(0.8f, 0.6f, 0.2f);
-        styleBox.SetBorderWidthAll(2);
-        styleBox.SetCornerRadiusAll(8);
-        styleBox.SetContentMarginAll(14);
-        _panel.AddThemeStyleboxOverride("panel", styleBox);
-
-        var vbox = new VBoxContainer();
-        vbox.AddThemeConstantOverride("separation", 6);
-        _panel.AddChild(vbox);
-
-        // Title bar — drag area + page controls + close button
-        var titleBar = new HBoxContainer();
-        titleBar.AddThemeConstantOverride("separation", 8);
-        titleBar.Alignment = BoxContainer.AlignmentMode.Center;
-        vbox.AddChild(titleBar);
-
-        if (maxPage > 0)
-        {
-            var prevBtn = CreateArrowButton("<", _currentPage > 0);
-            prevBtn.Pressed += () => PrevPage();
-            titleBar.AddChild(prevBtn);
-        }
-
-        var title = new Label();
-        string titleText = "Party Hands";
-        if (maxPage > 0)
-            titleText += $"  [{_currentPage + 1}/{maxPage + 1}]";
-        title.Text = titleText;
-        title.HorizontalAlignment = HorizontalAlignment.Center;
-        title.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
-        title.MouseFilter = Control.MouseFilterEnum.Ignore;
-        title.AddThemeColorOverride("font_color", new Color(0.9f, 0.7f, 0.2f));
-        title.AddThemeFontSizeOverride("font_size", 18);
-        titleBar.AddChild(title);
-
-        if (maxPage > 0)
-        {
-            var nextBtn = CreateArrowButton(">", _currentPage < maxPage);
-            nextBtn.Pressed += () => NextPage();
-            titleBar.AddChild(nextBtn);
-        }
-
-        // Close button
-        var closeBtn = new Button();
-        closeBtn.Text = "X";
-        closeBtn.CustomMinimumSize = new Vector2(28, 28);
-        closeBtn.Pressed += () => Hide();
-        var closeStyle = new StyleBoxFlat();
-        closeStyle.BgColor = new Color(0.3f, 0.1f, 0.1f);
-        closeStyle.BorderColor = new Color(0.6f, 0.2f, 0.2f);
-        closeStyle.SetBorderWidthAll(1);
-        closeStyle.SetCornerRadiusAll(4);
-        closeStyle.SetContentMarginAll(2);
-        closeBtn.AddThemeStyleboxOverride("normal", closeStyle);
-        var closeHover = new StyleBoxFlat();
-        closeHover.BgColor = new Color(0.5f, 0.15f, 0.15f);
-        closeHover.BorderColor = new Color(0.8f, 0.3f, 0.3f);
-        closeHover.SetBorderWidthAll(1);
-        closeHover.SetCornerRadiusAll(4);
-        closeHover.SetContentMarginAll(2);
-        closeBtn.AddThemeStyleboxOverride("hover", closeHover);
-        closeBtn.AddThemeStyleboxOverride("pressed", closeHover);
-        closeBtn.AddThemeColorOverride("font_color", new Color(0.9f, 0.4f, 0.4f));
-        closeBtn.AddThemeFontSizeOverride("font_size", 14);
-        titleBar.AddChild(closeBtn);
-
-        ulong localNetId = 0;
-        try { localNetId = RunManager.Instance?.NetService?.NetId ?? 0; } catch { }
-
-        for (int i = startIdx; i < endIdx; i++)
-        {
-            var player = players[i];
-            string debugSuffix = DebugDuplicatePlayers > 0 ? $" #{i + 1}" : null;
-            var section = new PlayerHandSection(player, localNetId, debugSuffix);
-            section.AddTo(vbox);
-            _sections.Add(section);
-        }
-
-        var hint = new Label();
-        hint.Text = "Drag to move | Click outside to close";
-        hint.HorizontalAlignment = HorizontalAlignment.Center;
-        hint.MouseFilter = Control.MouseFilterEnum.Ignore;
-        hint.AddThemeColorOverride("font_color", new Color(0.5f, 0.5f, 0.5f));
-        hint.AddThemeFontSizeOverride("font_size", 11);
-        vbox.AddChild(hint);
-
-        _canvasLayer.AddChild(_panel);
-
-        // Position: restore saved or center on screen
-        if (_savedPosition.HasValue)
-        {
-            _panel.Position = _savedPosition.Value;
-        }
-        else
-        {
-            // Defer centering until layout is resolved
-            _panel.CallDeferred("set_position", GetCenteredPosition());
-        }
-
-        _visible = true;
-    }
-
-    private static Vector2 GetCenteredPosition()
-    {
-        var viewport = NGame.Instance?.GetViewport()?.GetVisibleRect().Size ?? new Vector2(1920, 1080);
-        // Start centered horizontally, near the top
-        float x = viewport.X / 2 - 500;
-        if (x < 0) x = 0;
-        return new Vector2(x, 20);
-    }
-
-    private static Button CreateArrowButton(string text, bool enabled)
-    {
-        var btn = new Button();
-        btn.Text = text;
-        btn.CustomMinimumSize = new Vector2(32, 28);
-        btn.Disabled = !enabled;
-
-        var style = new StyleBoxFlat();
-        style.BgColor = enabled ? new Color(0.2f, 0.18f, 0.12f) : new Color(0.15f, 0.15f, 0.15f);
-        style.BorderColor = enabled ? new Color(0.8f, 0.6f, 0.2f) : new Color(0.4f, 0.4f, 0.4f);
-        style.SetBorderWidthAll(1);
-        style.SetCornerRadiusAll(4);
-        style.SetContentMarginAll(4);
-        btn.AddThemeStyleboxOverride("normal", style);
-
-        var hoverStyle = new StyleBoxFlat();
-        hoverStyle.BgColor = new Color(0.3f, 0.25f, 0.15f);
-        hoverStyle.BorderColor = new Color(0.9f, 0.7f, 0.2f);
-        hoverStyle.SetBorderWidthAll(1);
-        hoverStyle.SetCornerRadiusAll(4);
-        hoverStyle.SetContentMarginAll(4);
-        btn.AddThemeStyleboxOverride("hover", hoverStyle);
-
-        var pressedStyle = new StyleBoxFlat();
-        pressedStyle.BgColor = new Color(0.35f, 0.3f, 0.15f);
-        pressedStyle.BorderColor = new Color(1f, 0.8f, 0.3f);
-        pressedStyle.SetBorderWidthAll(1);
-        pressedStyle.SetCornerRadiusAll(4);
-        pressedStyle.SetContentMarginAll(4);
-        btn.AddThemeStyleboxOverride("pressed", pressedStyle);
-
-        btn.AddThemeStyleboxOverride("disabled", style);
-        btn.AddThemeColorOverride("font_color", enabled ? new Color(0.9f, 0.7f, 0.2f) : new Color(0.4f, 0.4f, 0.4f));
-        btn.AddThemeColorOverride("font_disabled_color", new Color(0.4f, 0.4f, 0.4f));
-        btn.AddThemeFontSizeOverride("font_size", 16);
-
-        return btn;
-    }
-
-    public static bool IsPointInPanel(Vector2 point)
-    {
-        if (!_visible || _panel == null || !GodotObject.IsInstanceValid(_panel)) return false;
-        return _panel.GetGlobalRect().HasPoint(point);
-    }
-
-    public static void Hide()
-    {
-        // Save position before closing
-        if (_panel != null && GodotObject.IsInstanceValid(_panel))
-            _savedPosition = _panel.Position;
-
-        CleanupUI();
-        _visible = false;
-    }
-
-    private static void CleanupUI()
-    {
-        foreach (var section in _sections)
-            section.Cleanup();
-        _sections.Clear();
-
-        if (_canvasLayer != null && GodotObject.IsInstanceValid(_canvasLayer))
-            _canvasLayer.QueueFree();
-
-        _canvasLayer = null;
-        _panel = null;
-    }
-
-    /// <summary>
-    /// Resolves card description with computed values.
-    /// </summary>
-    internal static string ResolveDescription(object cardObj)
-    {
-        try
-        {
-            var tCard = Traverse.Create(cardObj);
-
-            try
-            {
-                var pile = tCard.Property("Pile").GetValue();
-                object? pileTypeEnum = null;
-                if (pile != null)
-                    pileTypeEnum = Traverse.Create(pile).Property("PileType").GetValue();
-
-                var method = cardObj.GetType().GetMethod("GetDescriptionForPile");
-                if (method != null)
-                {
-                    var result = method.Invoke(cardObj, new[] { pileTypeEnum, null });
-                    if (result is string text && !string.IsNullOrEmpty(text))
-                        return CleanDescriptionText(text);
-                }
-            }
-            catch { }
-
-            var descObj = tCard.Property("Description").GetValue();
-            if (descObj == null) return "";
-
-            string template = Traverse.Create(descObj).Method("GetFormattedText").GetValue<string>();
-            if (string.IsNullOrEmpty(template)) return "";
-
-            string resolved = ResolveVarPlaceholders(cardObj, template);
-            return CleanDescriptionText(resolved);
-        }
-        catch { return ""; }
-    }
-
-    private static string CleanDescriptionText(string text)
-    {
-        text = Regex.Replace(text,
-            @"(\[img\]res://\S+?/([^/]+?)(?:_icon)?\.png\[/img\])+",
-            match =>
-            {
-                int count = Regex.Matches(match.Value, @"\[img\]").Count;
-                var nameMatch = Regex.Match(match.Value, @"res://\S+?/([^/]+?)(?:_icon)?\.png");
-                string label = nameMatch.Success ? nameMatch.Groups[1].Value : "?";
-                label = MapIconLabel(label);
-                return count > 1 ? $"{count} {label}" : label;
-            },
-            RegexOptions.IgnoreCase);
-
-        text = Regex.Replace(text, @"\[/?[^\]]+\]", "");
-        text = Regex.Replace(text, @"res://\S+", "");
-        return text.Trim();
-    }
-
-    private static string MapIconLabel(string filename)
-    {
-        filename = filename.ToLowerInvariant();
-        if (filename.Contains("energy")) return "Energy";
-        if (filename.Contains("block")) return "Block";
-        if (filename.Contains("star")) return "Star";
-        if (filename.Contains("orb")) return "Orb";
-        return char.ToUpper(filename[0]) + filename.Substring(1);
-    }
-
-    private static string ResolveVarPlaceholders(object cardObj, string text)
-    {
-        var dvObj = Traverse.Create(cardObj).Property("DynamicVars").GetValue();
-        if (dvObj == null) return text;
-
-        return Regex.Replace(text, @"\{(\w+)(?::[^}]*)?\}", match =>
-        {
-            string varName = match.Groups[1].Value;
-            try
-            {
-                var tryGet = dvObj.GetType().GetMethod("TryGetValue");
-                if (tryGet != null)
-                {
-                    var args = new object[] { varName, null! };
-                    bool found = (bool)tryGet.Invoke(dvObj, args)!;
-                    if (found && args[1] != null)
-                    {
-                        int val = Traverse.Create(args[1]).Property<int>("IntValue").Value;
-                        return val.ToString();
-                    }
-                }
-            }
-            catch { }
-            return match.Value;
-        });
-    }
-
-    /// <summary>
-    /// Main panel that handles dragging (via _Input for reliability) and
-    /// click-outside-to-close behavior.
-    /// </summary>
-    private class HandPanel : PanelContainer { }
-
-    // Drag/click-outside state — driven from InputPatch
-    private static bool _dragging;
-    private static Vector2 _dragOffset;
-
-    /// <summary>
-    /// Called from InputPatch for all mouse events while the panel is visible.
-    /// Handles drag-to-move and click-outside-to-close.
-    /// </summary>
-    public static void HandleMouseInput(InputEvent @event)
-    {
-        if (!_visible || _panel == null || !GodotObject.IsInstanceValid(_panel)) return;
-
-        if (@event is InputEventMouseButton mb && mb.ButtonIndex == MouseButton.Left)
-        {
-            var mousePos = mb.Position;
-            var rect = _panel.GetGlobalRect();
-
-            if (mb.Pressed)
-            {
-                if (rect.HasPoint(mousePos))
-                {
-                    _dragging = true;
-                    _dragOffset = mousePos - _panel.Position;
-                }
-                else if (!SettingsMenu.IsPointInPanel(mousePos))
-                {
-                    _dragging = false;
-                    Hide();
-                }
-            }
-            else
-            {
-                _dragging = false;
-            }
-        }
-        else if (@event is InputEventMouseMotion mm && _dragging)
-        {
-            _panel.Position = mm.Position - _dragOffset;
-        }
-    }
-
-    private class PlayerHandSection
-    {
-        private readonly Player _player;
-        private readonly CardPile? _hand;
-        private readonly List<Control> _cardControls = new();
-        private HBoxContainer? _cardRow;
-        private Label? _nameLabel;
-        private readonly ulong _localNetId;
-        private readonly string? _debugSuffix;
-        private const int MaxHandSize = 12;
-
-        // Card sizing
-        private const int CardWidth = 100;
-        private const int PortraitHeight = 80;
-
-        private static readonly Color AttackColor = new(0.9f, 0.35f, 0.3f);
-        private static readonly Color SkillColor = new(0.3f, 0.55f, 0.9f);
-        private static readonly Color PowerColor = new(0.9f, 0.75f, 0.2f);
-        private static readonly Color StatusColor = new(0.5f, 0.5f, 0.5f);
-        private static readonly Color CurseColor = new(0.7f, 0.2f, 0.7f);
-        private static readonly Color DefaultCardColor = new(0.7f, 0.7f, 0.7f);
-
-        public PlayerHandSection(Player player, ulong localNetId, string? debugSuffix = null)
-        {
-            _player = player;
-            _hand = player.PlayerCombatState?.Hand;
-            _localNetId = localNetId;
-            _debugSuffix = debugSuffix;
-        }
-
-        public void AddTo(VBoxContainer parent)
-        {
-            parent.AddChild(new HSeparator());
-
-            bool isSelf = _player.NetId == _localNetId;
-            string steamName = PlatformUtil.GetPlayerName(PlatformType.Steam, _player.NetId);
-            string charClass = _player.Character?.Title?.GetFormattedText();
-            string displayName = !string.IsNullOrEmpty(steamName) ? steamName : (charClass ?? "Player");
-            if (!string.IsNullOrEmpty(charClass) && !string.IsNullOrEmpty(steamName))
-                displayName = $"{steamName} ({charClass})";
-            if (isSelf && _debugSuffix == null)
-                displayName += " (You)";
-            if (_debugSuffix != null)
-                displayName += _debugSuffix;
-
-            _nameLabel = new Label();
-            UpdateNameLabel(displayName);
-            _nameLabel.AddThemeColorOverride("font_color", isSelf
-                ? new Color(0.5f, 0.8f, 0.5f)
-                : new Color(0.9f, 0.9f, 0.9f));
-            _nameLabel.AddThemeFontSizeOverride("font_size", 14);
-            parent.AddChild(_nameLabel);
-
-            _cardRow = new HBoxContainer();
-            _cardRow.AddThemeConstantOverride("separation", 6);
-            parent.AddChild(_cardRow);
-
-            RefreshCards();
-
-            if (_hand != null)
-                _hand.ContentsChanged += OnHandChanged;
-        }
-
-        public void Cleanup()
-        {
-            if (_hand != null)
-                _hand.ContentsChanged -= OnHandChanged;
-            ClearCards();
-        }
-
-        private void OnHandChanged()
-        {
-            try { RefreshCards(); }
-            catch (Exception ex) { ModLog.Error("PlayerHandSection.OnHandChanged", ex); }
-        }
-
-        private void RefreshCards()
-        {
-            if (_cardRow == null || !GodotObject.IsInstanceValid(_cardRow)) return;
-            if (_hand == null) return;
-
-            ClearCards();
-
-            int count = _hand.Cards?.Count ?? 0;
-            UpdateNameLabel(null, count);
-
-            if (count == 0) return;
-
-            int toShow = Math.Min(count, MaxHandSize);
-            for (int i = 0; i < toShow; i++)
-            {
-                try
-                {
-                    var card = _hand.Cards[i];
-                    if (card == null) continue;
-
-                    var cardControl = CreateCompactCard(card);
-                    _cardRow.AddChild(cardControl);
-                    _cardControls.Add(cardControl);
-                }
-                catch (Exception ex)
-                {
-                    ModLog.Error($"PlayerHandSection: failed to create card {i}", ex);
-                }
-            }
-
-            if (count > MaxHandSize)
-            {
-                var overflow = new Label();
-                overflow.Text = $"+{count - MaxHandSize}";
-                overflow.AddThemeColorOverride("font_color", new Color(0.6f, 0.6f, 0.6f));
-                overflow.AddThemeFontSizeOverride("font_size", 12);
-                _cardRow.AddChild(overflow);
-                _cardControls.Add(overflow);
-            }
-        }
-
-        private static Control CreateCompactCard(dynamic card)
-        {
-            try
-            {
-                object cardObj = (object)card;
-                var tCard = Traverse.Create(cardObj);
-
-                Texture2D? portrait = null;
-                string cardName = "???";
-                string costText = "";
-                string description = "";
-                Color typeColor = DefaultCardColor;
-
-                try { portrait = tCard.Property<Texture2D>("Portrait").Value; } catch { }
-
-                try
-                {
-                    string title = tCard.Property<string>("Title").Value;
-                    if (!string.IsNullOrEmpty(title)) cardName = title;
-                    bool upgraded = tCard.Property<bool>("IsUpgraded").Value;
-                    if (upgraded && cardName != "???") cardName += "+";
-                }
-                catch { }
-
-                try
-                {
-                    var energyCostObj = tCard.Property("EnergyCost").GetValue();
-                    if (energyCostObj != null)
-                    {
-                        bool costsX = Traverse.Create(energyCostObj).Property<bool>("CostsX").Value;
-                        if (costsX) costText = "X";
-                        else
-                        {
-                            int cost = Traverse.Create(energyCostObj).Property<int>("Canonical").Value;
-                            if (cost >= 0) costText = cost.ToString();
-                        }
-                    }
-                }
-                catch { }
-
-                try
-                {
-                    var cardType = tCard.Property("Type").GetValue();
-                    if (cardType != null)
-                    {
-                        string typeName = cardType.ToString() ?? "";
-                        if (typeName.Contains("Attack")) typeColor = AttackColor;
-                        else if (typeName.Contains("Skill")) typeColor = SkillColor;
-                        else if (typeName.Contains("Power")) typeColor = PowerColor;
-                        else if (typeName.Contains("Status")) typeColor = StatusColor;
-                        else if (typeName.Contains("Curse")) typeColor = CurseColor;
-                    }
-                }
-                catch { }
-
-                description = ResolveDescription(cardObj);
-
-                return BuildCompactCard(portrait, cardName, costText, description, typeColor);
-            }
-            catch (Exception ex)
-            {
-                ModLog.Error("CreateCompactCard", ex);
-            }
-
-            return CreateCardFallback(card);
-        }
-
-        private static Control BuildCompactCard(
-            Texture2D? portrait, string cardName, string costText,
-            string description, Color typeColor)
-        {
-            var wrapper = new CardPanel();
-            wrapper.CustomMinimumSize = new Vector2(CardWidth, PortraitHeight + 20);
-            wrapper.CardName = cardName;
-            wrapper.CardDescription = description;
-            wrapper.WireUpTooltip();
-
-            var style = new StyleBoxFlat();
-            style.BgColor = new Color(0.08f, 0.08f, 0.12f, 0.95f);
-            style.BorderColor = typeColor;
-            style.SetBorderWidthAll(1);
-            style.SetCornerRadiusAll(4);
-            style.SetContentMarginAll(0);
-            wrapper.AddThemeStyleboxOverride("panel", style);
-
-            var vbox = new VBoxContainer();
-            vbox.AddThemeConstantOverride("separation", 0);
-            vbox.MouseFilter = Control.MouseFilterEnum.Pass;
-            wrapper.AddChild(vbox);
-
-            // Portrait
-            var imageContainer = new Control();
-            imageContainer.CustomMinimumSize = new Vector2(CardWidth, PortraitHeight);
-            imageContainer.ClipContents = true;
-            imageContainer.MouseFilter = Control.MouseFilterEnum.Pass;
-            vbox.AddChild(imageContainer);
-
-            if (portrait != null)
-            {
-                var portraitRect = new TextureRect();
-                portraitRect.Texture = portrait;
-                portraitRect.ExpandMode = TextureRect.ExpandModeEnum.IgnoreSize;
-                portraitRect.StretchMode = TextureRect.StretchModeEnum.KeepAspectCovered;
-                portraitRect.SetAnchorsPreset(Control.LayoutPreset.FullRect);
-                portraitRect.MouseFilter = Control.MouseFilterEnum.Ignore;
-                imageContainer.AddChild(portraitRect);
-            }
-
-            // Energy cost badge (top-left)
-            if (!string.IsNullOrEmpty(costText))
-            {
-                var costBg = new PanelContainer();
-                costBg.MouseFilter = Control.MouseFilterEnum.Ignore;
-                var costStyle = new StyleBoxFlat();
-                costStyle.BgColor = new Color(0, 0, 0, 0.75f);
-                costStyle.SetCornerRadiusAll(3);
-                costStyle.ContentMarginLeft = 5;
-                costStyle.ContentMarginRight = 5;
-                costStyle.ContentMarginTop = 1;
-                costStyle.ContentMarginBottom = 1;
-                costBg.AddThemeStyleboxOverride("panel", costStyle);
-                costBg.Position = new Vector2(2, 1);
-
-                var costLabel = new Label();
-                costLabel.Text = costText;
-                costLabel.MouseFilter = Control.MouseFilterEnum.Ignore;
-                costLabel.AddThemeColorOverride("font_color", Colors.White);
-                costLabel.AddThemeFontSizeOverride("font_size", 13);
-                costBg.AddChild(costLabel);
-
-                imageContainer.AddChild(costBg);
-            }
-
-            // Card name bar
-            var nameBar = new PanelContainer();
-            nameBar.MouseFilter = Control.MouseFilterEnum.Pass;
-            var nameStyle = new StyleBoxFlat();
-            nameStyle.BgColor = new Color(0.05f, 0.05f, 0.08f, 0.95f);
-            nameStyle.SetContentMarginAll(0);
-            nameStyle.ContentMarginLeft = 3;
-            nameStyle.ContentMarginRight = 3;
-            nameStyle.ContentMarginTop = 2;
-            nameStyle.ContentMarginBottom = 2;
-            nameBar.AddThemeStyleboxOverride("panel", nameStyle);
-
-            var nameLabel = new Label();
-            nameLabel.Text = cardName;
-            nameLabel.HorizontalAlignment = HorizontalAlignment.Center;
-            nameLabel.MouseFilter = Control.MouseFilterEnum.Ignore;
-            nameLabel.AddThemeColorOverride("font_color", typeColor);
-            nameLabel.AddThemeFontSizeOverride("font_size", 11);
-            nameLabel.ClipText = true;
-            nameLabel.CustomMinimumSize = new Vector2(CardWidth - 6, 0);
-            nameBar.AddChild(nameLabel);
-            vbox.AddChild(nameBar);
-
-            return wrapper;
-        }
-
-        private static PanelContainer CreateCardFallback(dynamic card)
-        {
-            string cardName = "???";
-            try
-            {
-                object cardObj = (object)card;
-                var tCard = Traverse.Create(cardObj);
-                string title = tCard.Property<string>("Title").Value;
-                if (!string.IsNullOrEmpty(title)) cardName = title;
-            }
-            catch { }
-
-            var panel = new PanelContainer();
-            var style = new StyleBoxFlat();
-            style.BgColor = new Color(0.15f, 0.15f, 0.2f, 0.9f);
-            style.BorderColor = DefaultCardColor;
-            style.SetBorderWidthAll(1);
-            style.SetCornerRadiusAll(4);
-            style.ContentMarginLeft = 4;
-            style.ContentMarginRight = 4;
-            style.ContentMarginTop = 2;
-            style.ContentMarginBottom = 2;
-            panel.AddThemeStyleboxOverride("panel", style);
-
-            var label = new Label();
-            label.Text = cardName;
-            label.AddThemeColorOverride("font_color", DefaultCardColor);
-            label.AddThemeFontSizeOverride("font_size", 11);
-            panel.AddChild(label);
-
-            return panel;
-        }
-
-        private void ClearCards()
-        {
-            foreach (var ctrl in _cardControls)
-            {
-                if (GodotObject.IsInstanceValid(ctrl))
-                    ctrl.QueueFree();
-            }
-            _cardControls.Clear();
-        }
-
-        private void UpdateNameLabel(string? baseName = null, int? count = null)
-        {
-            if (_nameLabel == null || !GodotObject.IsInstanceValid(_nameLabel)) return;
-            int c = count ?? _hand?.Cards?.Count ?? 0;
-            if (baseName != null)
-                _nameLabel.Text = $"{baseName} — Hand ({c})";
-            else
-            {
-                string current = _nameLabel.Text;
-                int dashIdx = current.IndexOf('—');
-                if (dashIdx > 0)
-                    _nameLabel.Text = current.Substring(0, dashIdx) + $"— Hand ({c})";
-            }
-        }
-    }
-
-    /// <summary>
-    /// Creates a HoverTip with plain strings (bypassing LocString requirement).
-    /// HoverTip is a record struct — must box it to mutate via reflection.
-    /// </summary>
-    private static IHoverTip CreateHoverTip(string title, string description)
-    {
-        object box = new HoverTip();
-        var type = typeof(HoverTip);
-        type.GetProperty("Title")!.SetValue(box, title);
-        type.GetProperty("Description")!.SetValue(box, description);
-        type.GetProperty("Id")!.SetValue(box, $"BetterSpire2_{title}");
-        return (IHoverTip)box;
-    }
-
-    /// <summary>
-    /// Card container that uses the game's native NHoverTipSet tooltip system.
-    /// </summary>
-    private class CardPanel : PanelContainer
-    {
-        public string CardName = "";
-        public string CardDescription = "";
-
-        public void WireUpTooltip()
-        {
-            MouseFilter = MouseFilterEnum.Stop;
-            MouseEntered += OnMouseEntered;
-            MouseExited += OnMouseExited;
-        }
-
-        private void OnMouseEntered()
-        {
-            try
-            {
-                var tip = CreateHoverTip(CardName, CardDescription);
-                var tipNode = NHoverTipSet.CreateAndShow(this, tip);
-                // Reparent tooltip into our CanvasLayer so it renders on top of the panel
-                var parent = tipNode.GetParent();
-                if (parent != null)
-                    parent.RemoveChild(tipNode);
-                _canvasLayer?.AddChild(tipNode);
-                tipNode.ZIndex = 500;
-                tipNode.GlobalPosition = GetViewport().GetMousePosition() + new Vector2(16, 0);
-            }
-            catch (Exception ex)
-            {
-                ModLog.Error("CardPanel tooltip show", ex);
-            }
-        }
-
-        private void OnMouseExited()
-        {
-            try
-            {
-                NHoverTipSet.Remove(this);
-            }
-            catch (Exception ex)
-            {
-                ModLog.Error("CardPanel tooltip hide", ex);
-            }
-        }
-    }
+	[Flags]
+	private enum ResizeEdge
+	{
+		None = 0,
+		Right = 1,
+		Bottom = 2
+	}
+
+	private class HandPanel : PanelContainer
+	{
+	}
+
+	private class PlayerHandSection
+	{
+		private class PotionIcon : TextureRect
+		{
+			[CompilerGenerated]
+			private static class _003C_003Eo__3
+			{
+				public static CallSite<Func<CallSite, object, object>> _003C_003Ep__0;
+
+				public static CallSite<Func<CallSite, object, Texture2D>> _003C_003Ep__1;
+
+				public static CallSite<Func<CallSite, object, object>> _003C_003Ep__2;
+
+				public static CallSite<Func<CallSite, object, object>> _003C_003Ep__3;
+
+				public static CallSite<Func<CallSite, object, string>> _003C_003Ep__4;
+
+				public static CallSite<Func<CallSite, object, object>> _003C_003Ep__5;
+
+				public static CallSite<Func<CallSite, object, object>> _003C_003Ep__6;
+
+				public static CallSite<Func<CallSite, object, string>> _003C_003Ep__7;
+			}
+
+			private readonly string _potionName;
+
+			private readonly string _potionDesc;
+
+			private Control? _tooltip;
+
+			public PotionIcon(dynamic potion)
+			{
+				//IL_0314: Unknown result type (might be due to invalid IL or missing references)
+				//IL_031e: Expected O, but got Unknown
+				//IL_0327: Unknown result type (might be due to invalid IL or missing references)
+				//IL_0331: Expected O, but got Unknown
+				try
+				{
+					if (_003C_003Eo__3._003C_003Ep__1 == null)
+					{
+						_003C_003Eo__3._003C_003Ep__1 = CallSite<Func<CallSite, object, Texture2D>>.Create(Binder.Convert((CSharpBinderFlags)0, typeof(Texture2D), typeof(PotionIcon)));
+					}
+					Func<CallSite, object, Texture2D> target = _003C_003Eo__3._003C_003Ep__1.Target;
+					CallSite<Func<CallSite, object, Texture2D>> _003C_003Ep__ = _003C_003Eo__3._003C_003Ep__1;
+					if (_003C_003Eo__3._003C_003Ep__0 == null)
+					{
+						_003C_003Eo__3._003C_003Ep__0 = CallSite<Func<CallSite, object, object>>.Create(Binder.GetMember((CSharpBinderFlags)0, "Image", typeof(PotionIcon), (System.Collections.Generic.IEnumerable<CSharpArgumentInfo>)(object)new CSharpArgumentInfo[1] { CSharpArgumentInfo.Create((CSharpArgumentInfoFlags)0, (string)null) }));
+					}
+					base.Texture = target.Invoke((CallSite)(object)_003C_003Ep__, _003C_003Eo__3._003C_003Ep__0.Target.Invoke((CallSite)(object)_003C_003Eo__3._003C_003Ep__0, (object)potion));
+					if (_003C_003Eo__3._003C_003Ep__4 == null)
+					{
+						_003C_003Eo__3._003C_003Ep__4 = CallSite<Func<CallSite, object, string>>.Create(Binder.Convert((CSharpBinderFlags)0, typeof(string), typeof(PotionIcon)));
+					}
+					Func<CallSite, object, string> target2 = _003C_003Eo__3._003C_003Ep__4.Target;
+					CallSite<Func<CallSite, object, string>> _003C_003Ep__2 = _003C_003Eo__3._003C_003Ep__4;
+					if (_003C_003Eo__3._003C_003Ep__2 == null)
+					{
+						_003C_003Eo__3._003C_003Ep__2 = CallSite<Func<CallSite, object, object>>.Create(Binder.GetMember((CSharpBinderFlags)0, "Title", typeof(PotionIcon), (System.Collections.Generic.IEnumerable<CSharpArgumentInfo>)(object)new CSharpArgumentInfo[1] { CSharpArgumentInfo.Create((CSharpArgumentInfoFlags)0, (string)null) }));
+					}
+					object obj = _003C_003Eo__3._003C_003Ep__2.Target.Invoke((CallSite)(object)_003C_003Eo__3._003C_003Ep__2, (object)potion);
+					object obj2;
+					if (obj == null)
+					{
+						obj2 = null;
+					}
+					else
+					{
+						if (_003C_003Eo__3._003C_003Ep__3 == null)
+						{
+							_003C_003Eo__3._003C_003Ep__3 = CallSite<Func<CallSite, object, object>>.Create(Binder.InvokeMember((CSharpBinderFlags)0, "GetFormattedText", (System.Collections.Generic.IEnumerable<System.Type>)null, typeof(PotionIcon), (System.Collections.Generic.IEnumerable<CSharpArgumentInfo>)(object)new CSharpArgumentInfo[1] { CSharpArgumentInfo.Create((CSharpArgumentInfoFlags)0, (string)null) }));
+						}
+						obj2 = _003C_003Eo__3._003C_003Ep__3.Target.Invoke((CallSite)(object)_003C_003Eo__3._003C_003Ep__3, obj);
+					}
+					if (obj2 == null)
+					{
+						obj2 = "???";
+					}
+					_potionName = target2.Invoke((CallSite)(object)_003C_003Ep__2, obj2);
+					if (_003C_003Eo__3._003C_003Ep__7 == null)
+					{
+						_003C_003Eo__3._003C_003Ep__7 = CallSite<Func<CallSite, object, string>>.Create(Binder.Convert((CSharpBinderFlags)0, typeof(string), typeof(PotionIcon)));
+					}
+					Func<CallSite, object, string> target3 = _003C_003Eo__3._003C_003Ep__7.Target;
+					CallSite<Func<CallSite, object, string>> _003C_003Ep__3 = _003C_003Eo__3._003C_003Ep__7;
+					if (_003C_003Eo__3._003C_003Ep__5 == null)
+					{
+						_003C_003Eo__3._003C_003Ep__5 = CallSite<Func<CallSite, object, object>>.Create(Binder.GetMember((CSharpBinderFlags)0, "DynamicDescription", typeof(PotionIcon), (System.Collections.Generic.IEnumerable<CSharpArgumentInfo>)(object)new CSharpArgumentInfo[1] { CSharpArgumentInfo.Create((CSharpArgumentInfoFlags)0, (string)null) }));
+					}
+					obj = _003C_003Eo__3._003C_003Ep__5.Target.Invoke((CallSite)(object)_003C_003Eo__3._003C_003Ep__5, (object)potion);
+					object obj3;
+					if (obj == null)
+					{
+						obj3 = null;
+					}
+					else
+					{
+						if (_003C_003Eo__3._003C_003Ep__6 == null)
+						{
+							_003C_003Eo__3._003C_003Ep__6 = CallSite<Func<CallSite, object, object>>.Create(Binder.InvokeMember((CSharpBinderFlags)0, "GetFormattedText", (System.Collections.Generic.IEnumerable<System.Type>)null, typeof(PotionIcon), (System.Collections.Generic.IEnumerable<CSharpArgumentInfo>)(object)new CSharpArgumentInfo[1] { CSharpArgumentInfo.Create((CSharpArgumentInfoFlags)0, (string)null) }));
+						}
+						obj3 = _003C_003Eo__3._003C_003Ep__6.Target.Invoke((CallSite)(object)_003C_003Eo__3._003C_003Ep__6, obj);
+					}
+					if (obj3 == null)
+					{
+						obj3 = "";
+					}
+					_potionDesc = target3.Invoke((CallSite)(object)_003C_003Ep__3, obj3);
+				}
+				catch
+				{
+					_potionName = "???";
+					_potionDesc = "";
+				}
+				_potionDesc = Regex.Replace(_potionDesc, "\\[/?[^\\]]+\\]", "");
+				_potionDesc = Regex.Replace(_potionDesc, "res://\\S+", "").Trim();
+				base.CustomMinimumSize = new Vector2(22f, 22f);
+				base.ExpandMode = ExpandModeEnum.IgnoreSize;
+				base.StretchMode = StretchModeEnum.KeepAspectCentered;
+				base.MouseFilter = MouseFilterEnum.Stop;
+				base.MouseEntered += new Action(ShowTooltip);
+				base.MouseExited += new Action(HideTooltip);
+			}
+
+			private void ShowTooltip()
+			{
+				HideTooltip();
+				try
+				{
+					PanelContainer panelContainer = new PanelContainer();
+					StyleBoxFlat styleBoxFlat = new StyleBoxFlat();
+					styleBoxFlat.BgColor = new Color(0.1f, 0.1f, 0.15f, 0.95f);
+					styleBoxFlat.BorderColor = new Color(0.6f, 0.5f, 0.2f);
+					styleBoxFlat.SetBorderWidthAll(1);
+					styleBoxFlat.SetCornerRadiusAll(4);
+					styleBoxFlat.SetContentMarginAll(8f);
+					panelContainer.AddThemeStyleboxOverride("panel", styleBoxFlat);
+					VBoxContainer vBoxContainer = new VBoxContainer();
+					vBoxContainer.AddThemeConstantOverride("separation", 4);
+					panelContainer.AddChild(vBoxContainer, forceReadableName: false, InternalMode.Disabled);
+					Label label = new Label();
+					label.Text = _potionName;
+					label.AddThemeColorOverride("font_color", new Color(0.9f, 0.8f, 0.3f));
+					label.AddThemeFontSizeOverride("font_size", 13);
+					vBoxContainer.AddChild(label, forceReadableName: false, InternalMode.Disabled);
+					if (!string.IsNullOrEmpty(_potionDesc))
+					{
+						Label label2 = new Label();
+						label2.Text = _potionDesc;
+						label2.AddThemeColorOverride("font_color", new Color(0.8f, 0.8f, 0.8f));
+						label2.AddThemeFontSizeOverride("font_size", 11);
+						label2.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+						label2.CustomMinimumSize = new Vector2(200f, 0f);
+						vBoxContainer.AddChild(label2, forceReadableName: false, InternalMode.Disabled);
+					}
+					panelContainer.ZIndex = 300;
+					if (_canvasLayer != null && GodotObject.IsInstanceValid(_canvasLayer))
+					{
+						_canvasLayer.AddChild(panelContainer, forceReadableName: false, InternalMode.Disabled);
+						Vector2 position = base.GlobalPosition + new Vector2(0f, 26f);
+						panelContainer.Position = position;
+						_tooltip = panelContainer;
+					}
+				}
+				catch (System.Exception ex)
+				{
+					ModLog.Error("PotionIcon tooltip show", ex);
+				}
+			}
+
+			private void HideTooltip()
+			{
+				try
+				{
+					if (_tooltip != null && GodotObject.IsInstanceValid(_tooltip))
+					{
+						_tooltip.QueueFree();
+					}
+					_tooltip = null;
+				}
+				catch
+				{
+				}
+			}
+		}
+
+		[CompilerGenerated]
+		private static class _003C_003Eo__53
+		{
+			public static CallSite<Func<CallSite, System.Type, object, object>> _003C_003Ep__0;
+
+			public static CallSite<Func<CallSite, object, Control>> _003C_003Ep__1;
+		}
+
+		private readonly Player _player;
+
+		private CardPile? _hand;
+
+		private readonly List<Control> _cardControls = new List<Control>();
+
+		private readonly List<CardModel> _subscribedCards = new List<CardModel>();
+
+		private Container? _cardRow;
+
+		private Label? _nameLabel;
+
+		private HBoxContainer? _statsRow;
+
+		private HBoxContainer? _potionRow;
+
+		private readonly ulong _localNetId;
+
+		private readonly string? _debugSuffix;
+
+		private const int MaxHandSize = 12;
+
+		private const int BaseCardWidth = 58;
+
+		private const int BasePortraitHeight = 44;
+
+		private static readonly Color AttackColor = new Color(0.9f, 0.35f, 0.3f);
+
+		private static readonly Color SkillColor = new Color(0.3f, 0.55f, 0.9f);
+
+		private static readonly Color PowerColor = new Color(0.9f, 0.75f, 0.2f);
+
+		private static readonly Color StatusColor = new Color(0.5f, 0.5f, 0.5f);
+
+		private static readonly Color CurseColor = new Color(0.7f, 0.2f, 0.7f);
+
+		private static readonly Color DefaultCardColor = new Color(0.7f, 0.7f, 0.7f);
+
+		private static readonly Color EnergyColor = new Color(0.3f, 0.7f, 1f);
+
+		private static readonly Color StarsColor = new Color(1f, 0.85f, 0.3f);
+
+		private bool _subscribedToHistory;
+
+		private const int PotionIconSize = 22;
+
+		private static Texture2D? _iconVuln;
+
+		private static Texture2D? _iconWeak;
+
+		private static Texture2D? _iconDefend;
+
+		private static Texture2D? _iconStars;
+
+		private static readonly Dictionary<string, Texture2D?> _energyIconCache = new Dictionary<string, Texture2D>();
+
+		private const int StatIconSize = 14;
+
+		private static float CardScale => (float)ModSettings.CardScalePercent / 100f;
+
+		private static int CardWidth => (int)(58f * CardScale);
+
+		private static int PortraitHeight => (int)(44f * CardScale);
+
+		public bool IsHandNull => _hand == null;
+
+		private static int ScaledFont(int baseSize)
+		{
+			return Math.Max(7, (int)((float)baseSize * CardScale));
+		}
+
+		public PlayerHandSection(Player player, ulong localNetId, string? debugSuffix = null)
+		{
+			_player = player;
+			_hand = player.PlayerCombatState?.Hand;
+			_localNetId = localNetId;
+			_debugSuffix = debugSuffix;
+		}
+
+		public void AddTo(VBoxContainer parent)
+		{
+			parent.AddChild(new HSeparator(), forceReadableName: false, Node.InternalMode.Disabled);
+			bool flag = _player.NetId == _localNetId;
+			string playerName = PlatformUtil.GetPlayerName(PlatformType.Steam, _player.NetId);
+			string text = _player.Character?.Title?.GetFormattedText();
+			string text2 = ((!string.IsNullOrEmpty(playerName)) ? playerName : (text ?? "Player"));
+			if (!string.IsNullOrEmpty(text) && !string.IsNullOrEmpty(playerName))
+			{
+				text2 = playerName + " (" + text + ")";
+			}
+			if (flag && _debugSuffix == null)
+			{
+				text2 += " (You)";
+			}
+			if (_debugSuffix != null)
+			{
+				text2 += _debugSuffix;
+			}
+			_nameLabel = new Label();
+			UpdateNameLabel(text2);
+			_nameLabel.AddThemeColorOverride("font_color", flag ? new Color(0.5f, 0.8f, 0.5f) : new Color(0.9f, 0.9f, 0.9f));
+			_nameLabel.AddThemeFontSizeOverride("font_size", 14);
+			parent.AddChild(_nameLabel, forceReadableName: false, Node.InternalMode.Disabled);
+			HBoxContainer hBoxContainer = new HBoxContainer();
+			hBoxContainer.AddThemeConstantOverride("separation", 6);
+			parent.AddChild(hBoxContainer, forceReadableName: false, Node.InternalMode.Disabled);
+			_statsRow = new HBoxContainer();
+			_statsRow.AddThemeConstantOverride("separation", 10);
+			hBoxContainer.AddChild(_statsRow, forceReadableName: false, Node.InternalMode.Disabled);
+			_potionRow = new HBoxContainer();
+			_potionRow.AddThemeConstantOverride("separation", 4);
+			hBoxContainer.AddChild(_potionRow, forceReadableName: false, Node.InternalMode.Disabled);
+			RefreshPotions();
+			if (!ModSettings.CompactHandViewer)
+			{
+				HFlowContainer hFlowContainer = new HFlowContainer();
+				hFlowContainer.AddThemeConstantOverride("h_separation", 6);
+				hFlowContainer.AddThemeConstantOverride("v_separation", 6);
+				_cardRow = hFlowContainer;
+				parent.AddChild(_cardRow, forceReadableName: false, Node.InternalMode.Disabled);
+			}
+			RefreshCards();
+			SubscribeHand();
+			_player.PotionProcured += OnPotionChanged;
+			_player.PotionDiscarded += OnPotionChanged;
+			_player.UsedPotionRemoved += OnPotionChanged;
+			if (_player.Creature != null)
+			{
+				_player.Creature.PowerApplied += OnPowerChanged;
+				_player.Creature.PowerRemoved += OnPowerChanged;
+				_player.Creature.PowerIncreased += OnPowerStackChanged;
+				_player.Creature.PowerDecreased += OnPowerStackChanged;
+			}
+			if (_player.PlayerCombatState != null)
+			{
+				_player.PlayerCombatState.EnergyChanged += OnEnergyChanged;
+				_player.PlayerCombatState.StarsChanged += OnStarsChanged;
+			}
+		}
+
+		public void Cleanup()
+		{
+			UnsubscribeHand();
+			_player.PotionProcured -= OnPotionChanged;
+			_player.PotionDiscarded -= OnPotionChanged;
+			_player.UsedPotionRemoved -= OnPotionChanged;
+			if (_player.Creature != null)
+			{
+				_player.Creature.PowerApplied -= OnPowerChanged;
+				_player.Creature.PowerRemoved -= OnPowerChanged;
+				_player.Creature.PowerIncreased -= OnPowerStackChanged;
+				_player.Creature.PowerDecreased -= OnPowerStackChanged;
+			}
+			if (_player.PlayerCombatState != null)
+			{
+				_player.PlayerCombatState.EnergyChanged -= OnEnergyChanged;
+				_player.PlayerCombatState.StarsChanged -= OnStarsChanged;
+			}
+			UnsubscribeCardUpgrades();
+			ClearCards();
+		}
+
+		private void OnStarsChanged(int _, int __)
+		{
+			try
+			{
+				RefreshCards();
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("PlayerHandSection.OnStarsChanged", ex);
+			}
+		}
+
+		private void OnEnergyChanged(int _, int __)
+		{
+			try
+			{
+				RefreshCards();
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("PlayerHandSection.OnEnergyChanged", ex);
+			}
+		}
+
+		private void SubscribeHand()
+		{
+			//IL_0020: Unknown result type (might be due to invalid IL or missing references)
+			//IL_002a: Expected O, but got Unknown
+			//IL_0089: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0093: Expected O, but got Unknown
+			if (_hand != null)
+			{
+				_hand.ContentsChanged += new Action(OnHandChanged);
+				_hand.CardAdded += OnCardAddedOrRemoved;
+				_hand.CardRemoved += OnCardAddedOrRemoved;
+				CombatHistory combatHistory = CombatManager.Instance?.History;
+				if (combatHistory != null && !_subscribedToHistory)
+				{
+					combatHistory.Changed += new Action(OnHistoryChanged);
+					_subscribedToHistory = true;
+				}
+			}
+		}
+
+		private void UnsubscribeHand()
+		{
+			//IL_0020: Unknown result type (might be due to invalid IL or missing references)
+			//IL_002a: Expected O, but got Unknown
+			//IL_0086: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0090: Expected O, but got Unknown
+			if (_hand != null)
+			{
+				_hand.ContentsChanged -= new Action(OnHandChanged);
+				_hand.CardAdded -= OnCardAddedOrRemoved;
+				_hand.CardRemoved -= OnCardAddedOrRemoved;
+				CombatHistory combatHistory = CombatManager.Instance?.History;
+				if (combatHistory != null && _subscribedToHistory)
+				{
+					combatHistory.Changed -= new Action(OnHistoryChanged);
+					_subscribedToHistory = false;
+				}
+			}
+		}
+
+		private void OnHistoryChanged()
+		{
+			try
+			{
+				RefreshCards();
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("PlayerHandSection.OnHistoryChanged", ex);
+			}
+		}
+
+		public void RefreshHandReference()
+		{
+			CardPile cardPile = _player.PlayerCombatState?.Hand;
+			if (cardPile != _hand || _hand == null)
+			{
+				UnsubscribeHand();
+				_hand = cardPile;
+				SubscribeHand();
+				RefreshCards();
+			}
+		}
+
+		private void OnHandChanged()
+		{
+			try
+			{
+				RefreshCards();
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("PlayerHandSection.OnHandChanged", ex);
+			}
+		}
+
+		private void OnCardAddedOrRemoved(CardModel _)
+		{
+			try
+			{
+				RefreshCards();
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("PlayerHandSection.OnCardAddedOrRemoved", ex);
+			}
+		}
+
+		private void OnPotionChanged(PotionModel _)
+		{
+			try
+			{
+				RefreshPotions();
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("PlayerHandSection.OnPotionChanged", ex);
+			}
+		}
+
+		private void OnPowerChanged(PowerModel _)
+		{
+			try
+			{
+				RefreshCards();
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("PlayerHandSection.OnPowerChanged", ex);
+			}
+		}
+
+		private void OnPowerStackChanged(PowerModel _, int _2, bool _3)
+		{
+			try
+			{
+				RefreshCards();
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("PlayerHandSection.OnPowerStackChanged", ex);
+			}
+		}
+
+		private void OnPowerStackChanged(PowerModel _, bool _2)
+		{
+			try
+			{
+				RefreshCards();
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("PlayerHandSection.OnPowerStackChanged", ex);
+			}
+		}
+
+		private void UnsubscribeCardUpgrades()
+		{
+			//IL_0008: Unknown result type (might be due to invalid IL or missing references)
+			//IL_000d: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0022: Unknown result type (might be due to invalid IL or missing references)
+			//IL_002c: Expected O, but got Unknown
+			var enumerator = _subscribedCards.GetEnumerator();
+			try
+			{
+				while (enumerator.MoveNext())
+				{
+					CardModel current = enumerator.Current;
+					try
+					{
+						current.Upgraded -= new Action(OnCardUpgraded);
+					}
+					catch
+					{
+					}
+				}
+			}
+			finally
+			{
+				((System.IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+			}
+			_subscribedCards.Clear();
+		}
+
+		private void SubscribeCardUpgrades()
+		{
+			//IL_0041: Unknown result type (might be due to invalid IL or missing references)
+			//IL_004b: Expected O, but got Unknown
+			if (_hand?.Cards == null)
+			{
+				return;
+			}
+			System.Collections.Generic.IEnumerator<CardModel> enumerator = ((System.Collections.Generic.IEnumerable<CardModel>)_hand.Cards).GetEnumerator();
+			try
+			{
+				while (((System.Collections.IEnumerator)enumerator).MoveNext())
+				{
+					CardModel current = enumerator.Current;
+					try
+					{
+						current.Upgraded += new Action(OnCardUpgraded);
+						_subscribedCards.Add(current);
+					}
+					catch
+					{
+					}
+				}
+			}
+			finally
+			{
+				((System.IDisposable)enumerator)?.Dispose();
+			}
+		}
+
+		private void OnCardUpgraded()
+		{
+			try
+			{
+				RefreshCards();
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("PlayerHandSection.OnCardUpgraded", ex);
+			}
+		}
+
+		private void RefreshCards()
+		{
+			if (_hand == null)
+			{
+				return;
+			}
+			UnsubscribeCardUpgrades();
+			int num = ((System.Collections.Generic.IReadOnlyCollection<CardModel>)_hand.Cards)?.Count ?? 0;
+			int num2 = 0;
+			int num3 = 0;
+			int num4 = 0;
+			int num5 = 0;
+			if (num > 0)
+			{
+				System.Collections.Generic.IEnumerator<CardModel> enumerator = ((System.Collections.Generic.IEnumerable<CardModel>)_hand.Cards).GetEnumerator();
+				try
+				{
+					while (((System.Collections.IEnumerator)enumerator).MoveNext())
+					{
+						CardModel current = enumerator.Current;
+						try
+						{
+							object obj = current;
+							try
+							{
+								object value = Traverse.Create(obj).Property("DynamicVars").GetValue();
+								MethodInfo method = obj.GetType().GetMethod("UpdateDynamicVarPreview");
+								if (method != (MethodInfo)null && value != null)
+								{
+									System.Type type = System.Type.GetType("MegaCrit.Sts2.Core.Entities.Cards.CardPreviewMode, sts2");
+									if (type != (System.Type)null)
+									{
+										object obj2 = System.Enum.Parse(type, "Normal");
+										((MethodBase)method).Invoke(obj, new object[3] { obj2, null, value });
+									}
+								}
+							}
+							catch (System.Exception ex)
+							{
+								ModLog.Error("UpdateDynVarPreview", ex);
+							}
+							object value2 = Traverse.Create(obj).Property("DynamicVars").GetValue();
+							if (value2 == null)
+							{
+								continue;
+							}
+							MethodInfo method2 = value2.GetType().GetMethod("TryGetValue");
+							if (method2 == (MethodInfo)null)
+							{
+								continue;
+							}
+							object[] array = new object[2] { "Damage", null };
+							if ((bool)((MethodBase)method2).Invoke(value2, array) && array[1] != null)
+							{
+								try
+								{
+									num2 += (int)Traverse.Create(array[1]).Property<decimal>("PreviewValue").Value;
+								}
+								catch
+								{
+									try
+									{
+										num2 += Traverse.Create(array[1]).Property<int>("IntValue").Value;
+									}
+									catch
+									{
+									}
+								}
+							}
+							else
+							{
+								array = new object[2] { "CalculatedDamage", null };
+								if ((bool)((MethodBase)method2).Invoke(value2, array) && array[1] != null)
+								{
+									try
+									{
+										num2 += (int)Traverse.Create(array[1]).Property<decimal>("PreviewValue").Value;
+									}
+									catch
+									{
+										try
+										{
+											num2 += Traverse.Create(array[1]).Property<int>("IntValue").Value;
+										}
+										catch
+										{
+										}
+									}
+								}
+							}
+							if (((MemberInfo)((object)current).GetType()).Name != "SecondWind")
+							{
+								array = new object[2] { "Block", null };
+								if ((bool)((MethodBase)method2).Invoke(value2, array) && array[1] != null)
+								{
+									try
+									{
+										num3 += (int)Traverse.Create(array[1]).Property<decimal>("PreviewValue").Value;
+									}
+									catch
+									{
+										try
+										{
+											num3 += Traverse.Create(array[1]).Property<int>("IntValue").Value;
+										}
+										catch
+										{
+										}
+									}
+								}
+								else
+								{
+									array = new object[2] { "CalculatedBlock", null };
+									if ((bool)((MethodBase)method2).Invoke(value2, array) && array[1] != null)
+									{
+										try
+										{
+											num3 += (int)Traverse.Create(array[1]).Property<decimal>("PreviewValue").Value;
+										}
+										catch
+										{
+											try
+											{
+												num3 += Traverse.Create(array[1]).Property<int>("IntValue").Value;
+											}
+											catch
+											{
+											}
+										}
+									}
+								}
+							}
+							array = new object[2] { "WeakPower", null };
+							if ((bool)((MethodBase)method2).Invoke(value2, array) && array[1] != null)
+							{
+								try
+								{
+									num4 += Traverse.Create(array[1]).Property<int>("IntValue").Value;
+								}
+								catch
+								{
+									try
+									{
+										num4 += (int)Traverse.Create(array[1]).Property<float>("BaseValue").Value;
+									}
+									catch
+									{
+									}
+								}
+							}
+							array = new object[2] { "VulnerablePower", null };
+							if ((bool)((MethodBase)method2).Invoke(value2, array) && array[1] != null)
+							{
+								try
+								{
+									num5 += Traverse.Create(array[1]).Property<int>("IntValue").Value;
+								}
+								catch
+								{
+									try
+									{
+										num5 += (int)Traverse.Create(array[1]).Property<float>("BaseValue").Value;
+									}
+									catch
+									{
+									}
+								}
+							}
+							array = new object[2] { "Power", null };
+							if (!(bool)((MethodBase)method2).Invoke(value2, array) || array[1] == null)
+							{
+								continue;
+							}
+							int num6 = 0;
+							try
+							{
+								num6 = Traverse.Create(array[1]).Property<int>("IntValue").Value;
+							}
+							catch
+							{
+								try
+								{
+									num6 = (int)Traverse.Create(array[1]).Property<float>("BaseValue").Value;
+								}
+								catch
+								{
+								}
+							}
+							if (num6 > 0)
+							{
+								num4 += num6;
+								num5 += num6;
+							}
+						}
+						catch
+						{
+						}
+					}
+				}
+				finally
+				{
+					((System.IDisposable)enumerator)?.Dispose();
+				}
+			}
+			UpdateNameLabel(null, num, num2, num3, num4, num5);
+			SubscribeCardUpgrades();
+			if (ModSettings.CompactHandViewer || _cardRow == null || !GodotObject.IsInstanceValid(_cardRow))
+			{
+				return;
+			}
+			ClearCards();
+			if (num == 0)
+			{
+				return;
+			}
+			int num7 = Math.Min(num, 12);
+			for (int i = 0; i < num7; i++)
+			{
+				try
+				{
+					CardModel cardModel = _hand.Cards[i];
+					if (cardModel != null)
+					{
+						Control control = CreateCompactCard(cardModel);
+						_cardRow.AddChild(control, forceReadableName: false, Node.InternalMode.Disabled);
+						_cardControls.Add(control);
+					}
+				}
+				catch (System.Exception ex2)
+				{
+					ModLog.Error($"PlayerHandSection: failed to create card {i}", ex2);
+				}
+			}
+			if (num > 12)
+			{
+				Label label = new Label();
+				label.Text = $"+{num - 12}";
+				label.AddThemeColorOverride("font_color", new Color(0.6f, 0.6f, 0.6f));
+				label.AddThemeFontSizeOverride("font_size", 12);
+				_cardRow.AddChild(label, forceReadableName: false, Node.InternalMode.Disabled);
+				_cardControls.Add((Control)label);
+			}
+		}
+
+		private void RefreshPotions()
+		{
+			if (_potionRow == null || !GodotObject.IsInstanceValid(_potionRow))
+			{
+				return;
+			}
+			System.Collections.Generic.IEnumerator<Node> enumerator = _potionRow.GetChildren().GetEnumerator();
+			try
+			{
+				while (((System.Collections.IEnumerator)enumerator).MoveNext())
+				{
+					Node current = enumerator.Current;
+					current.QueueFree();
+				}
+			}
+			finally
+			{
+				((System.IDisposable)enumerator)?.Dispose();
+			}
+			try
+			{
+				System.Collections.Generic.IEnumerable<PotionModel> potions = _player.Potions;
+				if (potions == null)
+				{
+					return;
+				}
+				bool flag = false;
+				System.Collections.Generic.IEnumerator<PotionModel> enumerator2 = potions.GetEnumerator();
+				try
+				{
+					while (((System.Collections.IEnumerator)enumerator2).MoveNext())
+					{
+						PotionModel current2 = enumerator2.Current;
+						if (current2 != null)
+						{
+							if (!flag)
+							{
+								Label label = new Label();
+								label.Text = Localization.Get("deck.potions");
+								label.AddThemeColorOverride("font_color", new Color(0.6f, 0.6f, 0.6f));
+								label.AddThemeFontSizeOverride("font_size", 11);
+								label.MouseFilter = Control.MouseFilterEnum.Ignore;
+								_potionRow.AddChild(label, forceReadableName: false, Node.InternalMode.Disabled);
+								flag = true;
+							}
+							PotionIcon node = new PotionIcon(current2);
+							_potionRow.AddChild(node, forceReadableName: false, Node.InternalMode.Disabled);
+						}
+					}
+				}
+				finally
+				{
+					((System.IDisposable)enumerator2)?.Dispose();
+				}
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("RefreshPotions", ex);
+			}
+		}
+
+		private static Control CreateCompactCard(dynamic card)
+		{
+			try
+			{
+				Traverse traverse = Traverse.Create((object)card);
+				Texture2D portrait = null;
+				string text = "???";
+				string costText = "";
+				string text2 = "";
+				Color typeColor = DefaultCardColor;
+				try
+				{
+					portrait = traverse.Property<Texture2D>("Portrait").Value;
+				}
+				catch
+				{
+				}
+				try
+				{
+					string value = traverse.Property<string>("Title").Value;
+					if (!string.IsNullOrEmpty(value))
+					{
+						text = value;
+					}
+					if (traverse.Property<bool>("IsUpgraded").Value && text != "???")
+					{
+						text += "+";
+					}
+				}
+				catch
+				{
+				}
+				try
+				{
+					object value2 = traverse.Property("EnergyCost").GetValue();
+					if (value2 != null)
+					{
+						if (Traverse.Create(value2).Property<bool>("CostsX").Value)
+						{
+							costText = "X";
+						}
+						else
+						{
+							int value3 = Traverse.Create(value2).Property<int>("Canonical").Value;
+							if (value3 >= 0)
+							{
+								costText = value3.ToString();
+							}
+						}
+					}
+				}
+				catch
+				{
+				}
+				try
+				{
+					object value4 = traverse.Property("Type").GetValue();
+					if (value4 != null)
+					{
+						string text3 = value4.ToString() ?? "";
+						if (text3.Contains("Attack"))
+						{
+							typeColor = AttackColor;
+						}
+						else if (text3.Contains("Skill"))
+						{
+							typeColor = SkillColor;
+						}
+						else if (text3.Contains("Power"))
+						{
+							typeColor = PowerColor;
+						}
+						else if (text3.Contains("Status"))
+						{
+							typeColor = StatusColor;
+						}
+						else if (text3.Contains("Curse"))
+						{
+							typeColor = CurseColor;
+						}
+					}
+				}
+				catch
+				{
+				}
+				text2 = ResolveDescription((object)card);
+				int playMult = 1;
+				if (card is CardModel card2)
+				{
+					playMult = PlayCountHelper.GetEffectivePlayCount(card2);
+				}
+				return BuildCompactCard(portrait, text, costText, text2, typeColor, playMult);
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("CreateCompactCard", ex);
+			}
+			if (_003C_003Eo__53._003C_003Ep__1 == null)
+			{
+				_003C_003Eo__53._003C_003Ep__1 = CallSite<Func<CallSite, object, Control>>.Create(Binder.Convert((CSharpBinderFlags)0, typeof(Control), typeof(PlayerHandSection)));
+			}
+			Func<CallSite, object, Control> target = _003C_003Eo__53._003C_003Ep__1.Target;
+			CallSite<Func<CallSite, object, Control>> _003C_003Ep__ = _003C_003Eo__53._003C_003Ep__1;
+			if (_003C_003Eo__53._003C_003Ep__0 == null)
+			{
+				_003C_003Eo__53._003C_003Ep__0 = CallSite<Func<CallSite, System.Type, object, object>>.Create(Binder.InvokeMember((CSharpBinderFlags)0, "CreateCardFallback", (System.Collections.Generic.IEnumerable<System.Type>)null, typeof(PlayerHandSection), (System.Collections.Generic.IEnumerable<CSharpArgumentInfo>)(object)new CSharpArgumentInfo[2]
+				{
+					CSharpArgumentInfo.Create((CSharpArgumentInfoFlags)33, (string)null),
+					CSharpArgumentInfo.Create((CSharpArgumentInfoFlags)0, (string)null)
+				}));
+			}
+			return target.Invoke((CallSite)(object)_003C_003Ep__, _003C_003Eo__53._003C_003Ep__0.Target.Invoke((CallSite)(object)_003C_003Eo__53._003C_003Ep__0, typeof(PlayerHandSection), (object)card));
+		}
+
+		private static Control BuildCompactCard(Texture2D? portrait, string cardName, string costText, string description, Color typeColor, int playMult = 1)
+		{
+			CardPanel cardPanel = new CardPanel();
+			cardPanel.CustomMinimumSize = new Vector2(CardWidth, PortraitHeight + 16);
+			cardPanel.CardName = cardName;
+			cardPanel.CardDescription = description;
+			cardPanel.WireUpTooltip();
+			StyleBoxFlat styleBoxFlat = new StyleBoxFlat();
+			styleBoxFlat.BgColor = new Color(0.08f, 0.08f, 0.12f, 0.95f);
+			styleBoxFlat.BorderColor = typeColor;
+			styleBoxFlat.SetBorderWidthAll(1);
+			styleBoxFlat.SetCornerRadiusAll(4);
+			styleBoxFlat.SetContentMarginAll(0f);
+			cardPanel.AddThemeStyleboxOverride("panel", styleBoxFlat);
+			VBoxContainer vBoxContainer = new VBoxContainer();
+			vBoxContainer.AddThemeConstantOverride("separation", 0);
+			vBoxContainer.MouseFilter = Control.MouseFilterEnum.Pass;
+			cardPanel.AddChild(vBoxContainer, forceReadableName: false, Node.InternalMode.Disabled);
+			Control control = new Control();
+			control.CustomMinimumSize = new Vector2(CardWidth, PortraitHeight);
+			control.ClipContents = true;
+			control.MouseFilter = Control.MouseFilterEnum.Pass;
+			vBoxContainer.AddChild(control, forceReadableName: false, Node.InternalMode.Disabled);
+			if (portrait != null)
+			{
+				TextureRect textureRect = new TextureRect();
+				textureRect.Texture = portrait;
+				textureRect.ExpandMode = TextureRect.ExpandModeEnum.IgnoreSize;
+				textureRect.StretchMode = TextureRect.StretchModeEnum.KeepAspectCovered;
+				textureRect.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+				textureRect.MouseFilter = Control.MouseFilterEnum.Ignore;
+				control.AddChild(textureRect, forceReadableName: false, Node.InternalMode.Disabled);
+			}
+			if (!string.IsNullOrEmpty(costText))
+			{
+				PanelContainer panelContainer = new PanelContainer();
+				panelContainer.MouseFilter = Control.MouseFilterEnum.Ignore;
+				StyleBoxFlat styleBoxFlat2 = new StyleBoxFlat();
+				styleBoxFlat2.BgColor = new Color(0f, 0f, 0f, 0.75f);
+				styleBoxFlat2.SetCornerRadiusAll(3);
+				styleBoxFlat2.ContentMarginLeft = 3f;
+				styleBoxFlat2.ContentMarginRight = 3f;
+				styleBoxFlat2.ContentMarginTop = 1f;
+				styleBoxFlat2.ContentMarginBottom = 1f;
+				panelContainer.AddThemeStyleboxOverride("panel", styleBoxFlat2);
+				panelContainer.Position = new Vector2(2f, 1f);
+				Label label = new Label();
+				label.Text = costText;
+				label.MouseFilter = Control.MouseFilterEnum.Ignore;
+				label.AddThemeColorOverride("font_color", Colors.White);
+				label.AddThemeFontSizeOverride("font_size", ScaledFont(10));
+				panelContainer.AddChild(label, forceReadableName: false, Node.InternalMode.Disabled);
+				control.AddChild(panelContainer, forceReadableName: false, Node.InternalMode.Disabled);
+			}
+			if (playMult > 1)
+			{
+				PanelContainer panelContainer2 = new PanelContainer();
+				panelContainer2.MouseFilter = Control.MouseFilterEnum.Ignore;
+				StyleBoxFlat styleBoxFlat3 = new StyleBoxFlat();
+				styleBoxFlat3.BgColor = new Color(0.85f, 0.2f, 0.2f, 0.9f);
+				styleBoxFlat3.SetCornerRadiusAll(3);
+				styleBoxFlat3.ContentMarginLeft = 3f;
+				styleBoxFlat3.ContentMarginRight = 3f;
+				styleBoxFlat3.ContentMarginTop = 1f;
+				styleBoxFlat3.ContentMarginBottom = 1f;
+				panelContainer2.AddThemeStyleboxOverride("panel", styleBoxFlat3);
+				panelContainer2.SetAnchorsPreset(Control.LayoutPreset.TopRight);
+				panelContainer2.GrowHorizontal = Control.GrowDirection.Begin;
+				panelContainer2.OffsetRight = -2f;
+				panelContainer2.OffsetTop = 1f;
+				Label label2 = new Label();
+				label2.Text = $"x{playMult}";
+				label2.MouseFilter = Control.MouseFilterEnum.Ignore;
+				label2.AddThemeColorOverride("font_color", Colors.White);
+				label2.AddThemeFontSizeOverride("font_size", ScaledFont(10));
+				panelContainer2.AddChild(label2, forceReadableName: false, Node.InternalMode.Disabled);
+				control.AddChild(panelContainer2, forceReadableName: false, Node.InternalMode.Disabled);
+			}
+			PanelContainer panelContainer3 = new PanelContainer();
+			panelContainer3.MouseFilter = Control.MouseFilterEnum.Pass;
+			StyleBoxFlat styleBoxFlat4 = new StyleBoxFlat();
+			styleBoxFlat4.BgColor = new Color(0.05f, 0.05f, 0.08f, 0.95f);
+			styleBoxFlat4.SetContentMarginAll(0f);
+			styleBoxFlat4.ContentMarginLeft = 3f;
+			styleBoxFlat4.ContentMarginRight = 3f;
+			styleBoxFlat4.ContentMarginTop = 2f;
+			styleBoxFlat4.ContentMarginBottom = 2f;
+			panelContainer3.AddThemeStyleboxOverride("panel", styleBoxFlat4);
+			Label label3 = new Label();
+			label3.Text = cardName;
+			label3.HorizontalAlignment = HorizontalAlignment.Center;
+			label3.MouseFilter = Control.MouseFilterEnum.Ignore;
+			label3.AddThemeColorOverride("font_color", typeColor);
+			label3.AddThemeFontSizeOverride("font_size", ScaledFont(9));
+			label3.ClipText = true;
+			label3.CustomMinimumSize = new Vector2(CardWidth - 6, 0f);
+			panelContainer3.AddChild(label3, forceReadableName: false, Node.InternalMode.Disabled);
+			vBoxContainer.AddChild(panelContainer3, forceReadableName: false, Node.InternalMode.Disabled);
+			return cardPanel;
+		}
+
+		private static PanelContainer CreateCardFallback(dynamic card)
+		{
+			string text = "???";
+			try
+			{
+				Traverse traverse = Traverse.Create((object)card);
+				string value = traverse.Property<string>("Title").Value;
+				if (!string.IsNullOrEmpty(value))
+				{
+					text = value;
+				}
+			}
+			catch
+			{
+			}
+			PanelContainer panelContainer = new PanelContainer();
+			StyleBoxFlat styleBoxFlat = new StyleBoxFlat();
+			styleBoxFlat.BgColor = new Color(0.15f, 0.15f, 0.2f, 0.9f);
+			styleBoxFlat.BorderColor = DefaultCardColor;
+			styleBoxFlat.SetBorderWidthAll(1);
+			styleBoxFlat.SetCornerRadiusAll(4);
+			styleBoxFlat.ContentMarginLeft = 4f;
+			styleBoxFlat.ContentMarginRight = 4f;
+			styleBoxFlat.ContentMarginTop = 2f;
+			styleBoxFlat.ContentMarginBottom = 2f;
+			panelContainer.AddThemeStyleboxOverride("panel", styleBoxFlat);
+			Label label = new Label();
+			label.Text = text;
+			label.AddThemeColorOverride("font_color", DefaultCardColor);
+			label.AddThemeFontSizeOverride("font_size", ScaledFont(11));
+			panelContainer.AddChild(label, forceReadableName: false, Node.InternalMode.Disabled);
+			return panelContainer;
+		}
+
+		private void ClearCards()
+		{
+			//IL_0008: Unknown result type (might be due to invalid IL or missing references)
+			//IL_000d: Unknown result type (might be due to invalid IL or missing references)
+			var enumerator = _cardControls.GetEnumerator();
+			try
+			{
+				while (enumerator.MoveNext())
+				{
+					Control current = enumerator.Current;
+					if (GodotObject.IsInstanceValid(current))
+					{
+						current.QueueFree();
+					}
+				}
+			}
+			finally
+			{
+				((System.IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+			}
+			_cardControls.Clear();
+		}
+
+		private static Texture2D? GetIconVuln()
+		{
+			return LoadIcon("res://images/powers/vulnerable_power.png", ref _iconVuln);
+		}
+
+		private static Texture2D? GetIconWeak()
+		{
+			return LoadIcon("res://images/powers/weak_power.png", ref _iconWeak);
+		}
+
+		private static Texture2D? GetIconDefend()
+		{
+			return LoadIcon("res://images/packed/intents/intent_defend.png", ref _iconDefend);
+		}
+
+		private static Texture2D? GetIconStars()
+		{
+			return LoadIcon("res://images/packed/sprite_fonts/star_icon.png", ref _iconStars);
+		}
+
+		private static Texture2D? LoadIcon(string path, ref Texture2D? cache)
+		{
+			if (cache != null && GodotObject.IsInstanceValid(cache))
+			{
+				return cache;
+			}
+			try
+			{
+				cache = GD.Load<Texture2D>(path);
+			}
+			catch
+			{
+				cache = null;
+			}
+			return cache;
+		}
+
+		private static Texture2D? GetEnergyIcon(Player player)
+		{
+			string text;
+			try
+			{
+				text = player.Character?.CardPool?.EnergyColorName ?? "colorless";
+			}
+			catch
+			{
+				text = "colorless";
+			}
+			Texture2D texture2D = default(Texture2D);
+			if (_energyIconCache.TryGetValue(text, out texture2D) && texture2D != null && GodotObject.IsInstanceValid(texture2D))
+			{
+				return texture2D;
+			}
+			Texture2D texture2D2 = null;
+			try
+			{
+				texture2D2 = GD.Load<Texture2D>("res://images/packed/sprite_fonts/" + text + "_energy_icon.png");
+			}
+			catch
+			{
+			}
+			_energyIconCache[text] = texture2D2;
+			return texture2D2;
+		}
+
+		private void UpdateNameLabel(string? baseName = null, int? count = null, int totalDamage = 0, int totalBlock = 0, int weakStacks = 0, int vulnStacks = 0)
+		{
+			if (_nameLabel == null || !GodotObject.IsInstanceValid(_nameLabel))
+			{
+				return;
+			}
+			int num = count ?? (((System.Collections.Generic.IReadOnlyCollection<CardModel>)_hand?.Cards)?.Count).GetValueOrDefault();
+			if (baseName != null)
+			{
+				_nameLabel.Text = $"{baseName} — {Localization.Get("deck.hand")} ({num})";
+			}
+			else
+			{
+				string text = _nameLabel.Text;
+				int num2 = text.IndexOf('—');
+				if (num2 > 0)
+				{
+					_nameLabel.Text = text.Substring(0, num2) + $"— {Localization.Get("deck.hand")} ({num})";
+				}
+			}
+			if (_statsRow == null || !GodotObject.IsInstanceValid(_statsRow))
+			{
+				return;
+			}
+			System.Collections.Generic.IEnumerator<Node> enumerator = _statsRow.GetChildren().GetEnumerator();
+			try
+			{
+				while (((System.Collections.IEnumerator)enumerator).MoveNext())
+				{
+					Node current = enumerator.Current;
+					current.QueueFree();
+				}
+			}
+			finally
+			{
+				((System.IDisposable)enumerator)?.Dispose();
+			}
+			PlayerCombatState playerCombatState = _player.PlayerCombatState;
+			if (playerCombatState != null)
+			{
+				AddStatEntry(_statsRow, GetEnergyIcon(_player), $"{playerCombatState.Energy}/{playerCombatState.MaxEnergy}", EnergyColor);
+				if (playerCombatState.Stars > 0)
+				{
+					AddStatEntry(_statsRow, GetIconStars(), $"{playerCombatState.Stars}", StarsColor);
+				}
+			}
+			if (totalDamage > 0)
+			{
+				AddStatEntry(_statsRow, null, $"⚔ {totalDamage}", AttackColor);
+			}
+			if (totalBlock > 0)
+			{
+				AddStatEntry(_statsRow, GetIconDefend(), $"{totalBlock}", SkillColor);
+			}
+			if (weakStacks > 0)
+			{
+				AddStatEntry(_statsRow, GetIconWeak(), $"{weakStacks}", new Color(0.4f, 0.8f, 0.3f));
+			}
+			if (vulnStacks > 0)
+			{
+				AddStatEntry(_statsRow, GetIconVuln(), $"{vulnStacks}", new Color(1f, 0.6f, 0.2f));
+			}
+		}
+
+		private static void AddStatEntry(HBoxContainer row, Texture2D? icon, string text, Color color)
+		{
+			HBoxContainer hBoxContainer = new HBoxContainer();
+			hBoxContainer.AddThemeConstantOverride("separation", 2);
+			if (icon != null && GodotObject.IsInstanceValid(icon))
+			{
+				TextureRect textureRect = new TextureRect();
+				textureRect.Texture = icon;
+				textureRect.CustomMinimumSize = new Vector2(14f, 14f);
+				textureRect.ExpandMode = TextureRect.ExpandModeEnum.IgnoreSize;
+				textureRect.StretchMode = TextureRect.StretchModeEnum.KeepAspectCentered;
+				textureRect.MouseFilter = Control.MouseFilterEnum.Ignore;
+				hBoxContainer.AddChild(textureRect, forceReadableName: false, Node.InternalMode.Disabled);
+			}
+			Label label = new Label();
+			label.Text = text;
+			label.AddThemeColorOverride("font_color", color);
+			label.AddThemeFontSizeOverride("font_size", 12);
+			label.MouseFilter = Control.MouseFilterEnum.Ignore;
+			hBoxContainer.AddChild(label, forceReadableName: false, Node.InternalMode.Disabled);
+			row.AddChild(hBoxContainer, forceReadableName: false, Node.InternalMode.Disabled);
+		}
+	}
+
+	private class CardPanel : PanelContainer
+	{
+		public string CardName = "";
+
+		public string CardDescription = "";
+
+		private Control? _tooltip;
+
+		public void WireUpTooltip()
+		{
+			//IL_0012: Unknown result type (might be due to invalid IL or missing references)
+			//IL_001c: Expected O, but got Unknown
+			//IL_0025: Unknown result type (might be due to invalid IL or missing references)
+			//IL_002f: Expected O, but got Unknown
+			base.MouseFilter = MouseFilterEnum.Stop;
+			base.MouseEntered += new Action(ShowTooltip);
+			base.MouseExited += new Action(HideTooltip);
+		}
+
+		private void ShowTooltip()
+		{
+			HideTooltip();
+			try
+			{
+				if (_canvasLayer != null && GodotObject.IsInstanceValid(_canvasLayer))
+				{
+					PanelContainer panelContainer = new PanelContainer();
+					panelContainer.MouseFilter = MouseFilterEnum.Ignore;
+					StyleBoxFlat styleBoxFlat = new StyleBoxFlat();
+					styleBoxFlat.BgColor = new Color(0.1f, 0.1f, 0.15f, 0.95f);
+					styleBoxFlat.BorderColor = new Color(0.6f, 0.5f, 0.2f);
+					styleBoxFlat.SetBorderWidthAll(1);
+					styleBoxFlat.SetCornerRadiusAll(4);
+					styleBoxFlat.SetContentMarginAll(8f);
+					panelContainer.AddThemeStyleboxOverride("panel", styleBoxFlat);
+					VBoxContainer vBoxContainer = new VBoxContainer();
+					vBoxContainer.AddThemeConstantOverride("separation", 4);
+					panelContainer.AddChild(vBoxContainer, forceReadableName: false, InternalMode.Disabled);
+					Label label = new Label();
+					label.Text = CardName;
+					label.AddThemeColorOverride("font_color", new Color(0.9f, 0.8f, 0.3f));
+					label.AddThemeFontSizeOverride("font_size", 13);
+					vBoxContainer.AddChild(label, forceReadableName: false, InternalMode.Disabled);
+					string text = CleanText(CardDescription);
+					if (!string.IsNullOrEmpty(text))
+					{
+						Label label2 = new Label();
+						label2.Text = text;
+						label2.AddThemeColorOverride("font_color", new Color(0.85f, 0.85f, 0.85f));
+						label2.AddThemeFontSizeOverride("font_size", 11);
+						label2.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+						label2.CustomMinimumSize = new Vector2(220f, 0f);
+						vBoxContainer.AddChild(label2, forceReadableName: false, InternalMode.Disabled);
+					}
+					panelContainer.ZIndex = 500;
+					_canvasLayer.AddChild(panelContainer, forceReadableName: false, InternalMode.Disabled);
+					panelContainer.GlobalPosition = GetViewport().GetMousePosition() + new Vector2(16f, 0f);
+					_tooltip = panelContainer;
+				}
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("CardPanel tooltip show", ex);
+			}
+		}
+
+		private void HideTooltip()
+		{
+			try
+			{
+				if (_tooltip != null && GodotObject.IsInstanceValid(_tooltip))
+				{
+					_tooltip.QueueFree();
+				}
+				_tooltip = null;
+			}
+			catch (System.Exception ex)
+			{
+				ModLog.Error("CardPanel tooltip hide", ex);
+			}
+		}
+
+		private static string CleanText(string s)
+		{
+			if (string.IsNullOrEmpty(s))
+			{
+				return "";
+			}
+			s = Regex.Replace(s, "\\[/?[^\\]]+\\]", "");
+			s = Regex.Replace(s, "res://\\S+", "");
+			return s.Trim();
+		}
+	}
+
+	[Serializable]
+	[CompilerGenerated]
+	private sealed class _003C_003Ec
+	{
+		public static readonly _003C_003Ec _003C_003E9 = new _003C_003Ec();
+
+		public static Action _003C_003E9__34_2;
+
+		public static Action _003C_003E9__34_3;
+
+		public static Action _003C_003E9__34_1;
+
+		public static MatchEvaluator _003C_003E9__46_0;
+
+		internal void _003CBuildUI_003Eb__34_2()
+		{
+			PrevPage();
+		}
+
+		internal void _003CBuildUI_003Eb__34_3()
+		{
+			NextPage();
+		}
+
+		internal void _003CBuildUI_003Eb__34_1()
+		{
+			Hide();
+		}
+
+		internal string _003CCleanDescriptionText_003Eb__46_0(Match match)
+		{
+			int count = Regex.Matches(((Capture)match).Value, "\\[img\\]").Count;
+			Match val = Regex.Match(((Capture)match).Value, "res://\\S+?/([^/]+?)(?:_icon)?\\.png");
+			string filename = (((Group)val).Success ? ((Capture)val.Groups[1]).Value : "?");
+			filename = MapIconLabel(filename);
+			return (count > 1) ? $"{count} {filename}" : filename;
+		}
+	}
+
+	public static int DebugDuplicatePlayers = 0;
+
+	private static CanvasLayer? _canvasLayer;
+
+	private static HandPanel? _panel;
+
+	private static bool _visible;
+
+	private static Label? _gripLabel;
+
+	private static readonly List<PlayerHandSection> _sections = new List<PlayerHandSection>();
+
+	private static Window? _popoutWindow;
+
+	private static int _currentPage;
+
+	private const int PlayersPerPage = 4;
+
+	private static bool _resizing;
+
+	private static ResizeEdge _resizeEdge;
+
+	private const float ResizeMargin = 8f;
+
+	private const float DefaultPanelWidth = 420f;
+
+	private const float MinPanelWidth = 230f;
+
+	private const float MinPanelHeight = 180f;
+
+	private static bool? _savedGuiEmbedSubwindows;
+
+	private static bool _dragging;
+
+	private static Vector2 _dragOffset;
+
+	private static bool IsPopoutMode => _popoutWindow != null && GodotObject.IsInstanceValid(_popoutWindow);
+
+	public static bool IsVisible => _visible;
+
+	public static void Toggle()
+	{
+		ResetStaleVisibleState();
+		ModLog.Info($"DeckTracker.Toggle: _visible={_visible}");
+		if (_visible)
+		{
+			Hide();
+		}
+		else
+		{
+			Show();
+		}
+	}
+
+	private static void ResetStaleVisibleState()
+	{
+		if (_visible)
+		{
+			bool flag = _canvasLayer != null && GodotObject.IsInstanceValid(_canvasLayer);
+			bool flag2 = _panel != null && GodotObject.IsInstanceValid(_panel);
+			if (!(flag && flag2))
+			{
+				ModLog.Info($"DeckTracker: stale _visible detected (canvas={flag}, panel={flag2}) — resetting");
+				_sections.Clear();
+				_canvasLayer = null;
+				_panel = null;
+				_gripLabel = null;
+				_popoutWindow = null;
+				_visible = false;
+				_resizing = false;
+			}
+		}
+	}
+
+	public static void ResetPosition()
+	{
+		bool visible = _visible;
+		if (visible)
+		{
+			Hide();
+		}
+		LayoutStore.HandViewerPos = null;
+		LayoutStore.HandViewerSize = null;
+		LayoutStore.HandViewerWindowPos = null;
+		LayoutStore.HandViewerWindowSize = null;
+		LayoutStore.Save();
+		if (visible)
+		{
+			Show();
+		}
+	}
+
+	public static bool ShowIfInCombat()
+	{
+		ResetStaleVisibleState();
+		if (!_visible)
+		{
+			Show();
+		}
+		return _visible;
+	}
+
+	public static void RefreshIfVisible()
+	{
+		if (_visible)
+		{
+			Refresh();
+		}
+	}
+
+	public static bool HasAnyNullHands()
+	{
+		//IL_0017: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001c: Unknown result type (might be due to invalid IL or missing references)
+		if (!_visible)
+		{
+			return false;
+		}
+		var enumerator = _sections.GetEnumerator();
+		try
+		{
+			while (enumerator.MoveNext())
+			{
+				PlayerHandSection current = enumerator.Current;
+				if (current.IsHandNull)
+				{
+					return true;
+				}
+			}
+		}
+		finally
+		{
+			((System.IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+		}
+		return false;
+	}
+
+	public static void OnCombatSetUp()
+	{
+		CombatManager instance = CombatManager.Instance;
+		if (instance != null)
+		{
+			ResetStaleVisibleState();
+			instance.TurnStarted -= OnTurnStarted;
+			instance.CombatEnded -= OnCombatEnded;
+			instance.TurnStarted += OnTurnStarted;
+			instance.CombatEnded += OnCombatEnded;
+			RefreshIfVisible();
+			if (ModSettings.AutoShowTeammateHand && ModSettings.ShowTeammateHand)
+			{
+				ShowIfInCombat();
+			}
+		}
+	}
+
+	private static void OnTurnStarted(CombatState _)
+	{
+		//IL_0015: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001a: Unknown result type (might be due to invalid IL or missing references)
+		if (!_visible)
+		{
+			return;
+		}
+		var enumerator = _sections.GetEnumerator();
+		try
+		{
+			while (enumerator.MoveNext())
+			{
+				PlayerHandSection current = enumerator.Current;
+				try
+				{
+					current.RefreshHandReference();
+				}
+				catch (System.Exception ex)
+				{
+					ModLog.Error("DeckTracker.OnTurnStarted", ex);
+				}
+			}
+		}
+		finally
+		{
+			((System.IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+		}
+	}
+
+	private static void OnCombatEnded(CombatRoom _)
+	{
+		try
+		{
+			Hide();
+			CombatManager instance = CombatManager.Instance;
+			if (instance != null)
+			{
+				instance.TurnStarted -= OnTurnStarted;
+				instance.CombatEnded -= OnCombatEnded;
+			}
+		}
+		catch (System.Exception ex)
+		{
+			ModLog.Error("DeckTracker.OnCombatEnded", ex);
+		}
+	}
+
+	public static void NextPage()
+	{
+		if (_visible)
+		{
+			int playerCount = GetPlayerCount();
+			int num = Math.Max(0, (playerCount - 1) / 4);
+			if (_currentPage < num)
+			{
+				_currentPage++;
+				Refresh();
+			}
+		}
+	}
+
+	public static void PrevPage()
+	{
+		if (_visible && _currentPage > 0)
+		{
+			_currentPage--;
+			Refresh();
+		}
+	}
+
+	private static int GetPlayerCount()
+	{
+		RunState value = Traverse.Create(RunManager.Instance).Property<RunState>("State").Value;
+		if (value?.Players == null)
+		{
+			return 0;
+		}
+		return (DebugDuplicatePlayers > 0) ? DebugDuplicatePlayers : ((System.Collections.Generic.IReadOnlyCollection<Player>)value.Players).Count;
+	}
+
+	private static void Show()
+	{
+		if (!ModSettings.ShowTeammateHand)
+		{
+			ModLog.Info("DeckTracker.Show: blocked — ShowTeammateHand is off");
+			return;
+		}
+		CombatManager instance = CombatManager.Instance;
+		if (instance == null)
+		{
+			ModLog.Info("DeckTracker.Show: blocked — CombatManager.Instance is null");
+			return;
+		}
+		CombatState combatState = instance.DebugOnlyGetState();
+		if (combatState == null)
+		{
+			ModLog.Info("DeckTracker.Show: blocked — combatState is null");
+			return;
+		}
+		RunState value = Traverse.Create(RunManager.Instance).Property<RunState>("State").Value;
+		if (value?.Players == null || ((System.Collections.Generic.IReadOnlyCollection<Player>)value.Players).Count == 0)
+		{
+			ModLog.Info("DeckTracker.Show: blocked — runState.Players is " + ((value?.Players == null) ? "null" : "empty"));
+			return;
+		}
+		ModLog.Info($"DeckTracker.Show: building UI for {((System.Collections.Generic.IReadOnlyCollection<Player>)value.Players).Count} players");
+		_currentPage = 0;
+		BuildUI(value);
+	}
+
+	private static void Refresh()
+	{
+		if (IsPopoutMode && _popoutWindow != null)
+		{
+			LayoutStore.HandViewerWindowPos = _popoutWindow.Position;
+			LayoutStore.HandViewerWindowSize = _popoutWindow.Size;
+		}
+		else if (_panel != null && GodotObject.IsInstanceValid(_panel))
+		{
+			LayoutStore.HandViewerPos = _panel.Position;
+			LayoutStore.HandViewerSize = _panel.Size;
+		}
+		RunState value = Traverse.Create(RunManager.Instance).Property<RunState>("State").Value;
+		if (value?.Players != null)
+		{
+			CleanupUI();
+			BuildUI(value);
+		}
+	}
+
+	private static void BuildUI(RunState runState)
+	{
+		//IL_03d8: Unknown result type (might be due to invalid IL or missing references)
+		//IL_03dd: Unknown result type (might be due to invalid IL or missing references)
+		//IL_03e3: Expected O, but got Unknown
+		//IL_057b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0580: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0586: Expected O, but got Unknown
+		//IL_051b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0520: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0526: Expected O, but got Unknown
+		if (_visible)
+		{
+			CleanupUI();
+		}
+		NGame instance = NGame.Instance;
+		if (instance == null)
+		{
+			return;
+		}
+		if (ModSettings.HandViewerPopout && !IsExclusiveFullscreen())
+		{
+			_popoutWindow = BuildPopoutWindow(instance);
+		}
+		_canvasLayer = new CanvasLayer();
+		_canvasLayer.Layer = 10;
+		if (_popoutWindow != null)
+		{
+			_popoutWindow.AddChild(_canvasLayer, forceReadableName: false, Node.InternalMode.Disabled);
+		}
+		else
+		{
+			instance.AddChild(_canvasLayer, forceReadableName: false, Node.InternalMode.Disabled);
+		}
+		ulong localNetId = 0uL;
+		try
+		{
+			localNetId = (RunManager.Instance?.NetService?.NetId).GetValueOrDefault();
+		}
+		catch
+		{
+		}
+		List<Player> val = new List<Player>();
+		if (DebugDuplicatePlayers > 0)
+		{
+			Player player = runState.Players[0];
+			for (int i = 0; i < DebugDuplicatePlayers; i++)
+			{
+				val.Add(player);
+			}
+		}
+		else
+		{
+			val.AddRange((System.Collections.Generic.IEnumerable<Player>)runState.Players);
+		}
+		if (ModSettings.HideOwnHand && localNetId != 0)
+		{
+			val.RemoveAll((Predicate<Player>)((Player p) => p.NetId == localNetId));
+		}
+		int count = val.Count;
+		int num = Math.Max(0, (count - 1) / 4);
+		_currentPage = Math.Min(_currentPage, num);
+		int num2 = _currentPage * 4;
+		int num3 = Math.Min(num2 + 4, count);
+		_panel = new HandPanel();
+		_panel.ZIndex = 200;
+		_panel.ClipContents = true;
+		Vector2 size = LayoutStore.HandViewerSize ?? new Vector2(420f, 0f);
+		if (size.X < 230f)
+		{
+			size.X = 230f;
+		}
+		_panel.CustomMinimumSize = new Vector2(230f, 180f);
+		if (LayoutStore.HandViewerSize.HasValue)
+		{
+			_panel.Size = size;
+		}
+		StyleBoxFlat styleBoxFlat = new StyleBoxFlat();
+		float num4 = Math.Clamp((float)ModSettings.HandViewerOpacityPercent / 100f, 0f, 1f);
+		styleBoxFlat.BgColor = new Color(0.05f, 0.05f, 0.08f, num4);
+		styleBoxFlat.BorderColor = new Color(0f, 0f, 0f, 0f);
+		styleBoxFlat.SetBorderWidthAll(0);
+		styleBoxFlat.SetCornerRadiusAll((num4 > 0f) ? 6 : 0);
+		styleBoxFlat.SetContentMarginAll(14f);
+		_panel.AddThemeStyleboxOverride("panel", styleBoxFlat);
+		ScrollContainer scrollContainer = new ScrollContainer();
+		scrollContainer.SizeFlagsVertical = Control.SizeFlags.ExpandFill;
+		scrollContainer.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
+		scrollContainer.HorizontalScrollMode = ScrollContainer.ScrollMode.Disabled;
+		scrollContainer.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+		_panel.AddChild(scrollContainer, forceReadableName: false, Node.InternalMode.Disabled);
+		VBoxContainer vBoxContainer = new VBoxContainer();
+		vBoxContainer.AddThemeConstantOverride("separation", 6);
+		vBoxContainer.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
+		scrollContainer.AddChild(vBoxContainer, forceReadableName: false, Node.InternalMode.Disabled);
+		HBoxContainer hBoxContainer = new HBoxContainer();
+		hBoxContainer.AddThemeConstantOverride("separation", 8);
+		hBoxContainer.Alignment = BoxContainer.AlignmentMode.Center;
+		vBoxContainer.AddChild(hBoxContainer, forceReadableName: false, Node.InternalMode.Disabled);
+		if (num > 0)
+		{
+			Button button = CreateArrowButton("<", _currentPage > 0);
+			object obj2 = _003C_003Ec._003C_003E9__34_2;
+			if (obj2 == null)
+			{
+				Action val2 = delegate
+				{
+					PrevPage();
+				};
+				_003C_003Ec._003C_003E9__34_2 = val2;
+				obj2 = (object)val2;
+			}
+			button.Pressed += (Action)obj2;
+			hBoxContainer.AddChild(button, forceReadableName: false, Node.InternalMode.Disabled);
+		}
+		Label label = new Label();
+		string text = Localization.Get("deck.title");
+		if (num > 0)
+		{
+			text += $"  [{_currentPage + 1}/{num + 1}]";
+		}
+		label.Text = text;
+		label.HorizontalAlignment = HorizontalAlignment.Center;
+		label.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
+		label.MouseFilter = Control.MouseFilterEnum.Ignore;
+		label.AddThemeColorOverride("font_color", new Color(0.9f, 0.7f, 0.2f));
+		label.AddThemeFontSizeOverride("font_size", 18);
+		hBoxContainer.AddChild(label, forceReadableName: false, Node.InternalMode.Disabled);
+		if (num > 0)
+		{
+			Button button2 = CreateArrowButton(">", _currentPage < num);
+			object obj3 = _003C_003Ec._003C_003E9__34_3;
+			if (obj3 == null)
+			{
+				Action val3 = delegate
+				{
+					NextPage();
+				};
+				_003C_003Ec._003C_003E9__34_3 = val3;
+				obj3 = (object)val3;
+			}
+			button2.Pressed += (Action)obj3;
+			hBoxContainer.AddChild(button2, forceReadableName: false, Node.InternalMode.Disabled);
+		}
+		Button button3 = new Button();
+		button3.Text = "X";
+		button3.CustomMinimumSize = new Vector2(28f, 28f);
+		object obj4 = _003C_003Ec._003C_003E9__34_1;
+		if (obj4 == null)
+		{
+			Action val4 = delegate
+			{
+				Hide();
+			};
+			_003C_003Ec._003C_003E9__34_1 = val4;
+			obj4 = (object)val4;
+		}
+		button3.Pressed += (Action)obj4;
+		StyleBoxFlat styleBoxFlat2 = new StyleBoxFlat();
+		styleBoxFlat2.BgColor = new Color(0.3f, 0.1f, 0.1f);
+		styleBoxFlat2.BorderColor = new Color(0.6f, 0.2f, 0.2f);
+		styleBoxFlat2.SetBorderWidthAll(1);
+		styleBoxFlat2.SetCornerRadiusAll(4);
+		styleBoxFlat2.SetContentMarginAll(2f);
+		button3.AddThemeStyleboxOverride("normal", styleBoxFlat2);
+		StyleBoxFlat styleBoxFlat3 = new StyleBoxFlat();
+		styleBoxFlat3.BgColor = new Color(0.5f, 0.15f, 0.15f);
+		styleBoxFlat3.BorderColor = new Color(0.8f, 0.3f, 0.3f);
+		styleBoxFlat3.SetBorderWidthAll(1);
+		styleBoxFlat3.SetCornerRadiusAll(4);
+		styleBoxFlat3.SetContentMarginAll(2f);
+		button3.AddThemeStyleboxOverride("hover", styleBoxFlat3);
+		button3.AddThemeStyleboxOverride("pressed", styleBoxFlat3);
+		button3.AddThemeColorOverride("font_color", new Color(0.9f, 0.4f, 0.4f));
+		button3.AddThemeFontSizeOverride("font_size", 14);
+		hBoxContainer.AddChild(button3, forceReadableName: false, Node.InternalMode.Disabled);
+		if (ModSettings.CompactHandViewer)
+		{
+			GridContainer gridContainer = new GridContainer();
+			gridContainer.Columns = 2;
+			gridContainer.AddThemeConstantOverride("h_separation", 16);
+			gridContainer.AddThemeConstantOverride("v_separation", 8);
+			vBoxContainer.AddChild(gridContainer, forceReadableName: false, Node.InternalMode.Disabled);
+			for (int num5 = num2; num5 < num3; num5++)
+			{
+				Player player2 = val[num5];
+				string debugSuffix = ((DebugDuplicatePlayers > 0) ? $" #{num5 + 1}" : null);
+				PlayerHandSection playerHandSection = new PlayerHandSection(player2, localNetId, debugSuffix);
+				VBoxContainer vBoxContainer2 = new VBoxContainer();
+				vBoxContainer2.AddThemeConstantOverride("separation", 2);
+				vBoxContainer2.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
+				playerHandSection.AddTo(vBoxContainer2);
+				gridContainer.AddChild(vBoxContainer2, forceReadableName: false, Node.InternalMode.Disabled);
+				_sections.Add(playerHandSection);
+			}
+		}
+		else
+		{
+			for (int num6 = num2; num6 < num3; num6++)
+			{
+				Player player3 = val[num6];
+				string debugSuffix2 = ((DebugDuplicatePlayers > 0) ? $" #{num6 + 1}" : null);
+				PlayerHandSection playerHandSection2 = new PlayerHandSection(player3, localNetId, debugSuffix2);
+				playerHandSection2.AddTo(vBoxContainer);
+				_sections.Add(playerHandSection2);
+			}
+		}
+		Label label2 = new Label();
+		if (IsPopoutMode)
+		{
+			label2.Text = "Drag title bar to move | F3 or X to close";
+		}
+		else if (ModSettings.AlwaysShowTeammateHand)
+		{
+			label2.Text = "Drag to move | Drag edges to resize | F3 or X to close";
+		}
+		else
+		{
+			label2.Text = "Drag to move | Drag edges to resize | Click outside to close";
+		}
+		label2.HorizontalAlignment = HorizontalAlignment.Center;
+		label2.MouseFilter = Control.MouseFilterEnum.Ignore;
+		label2.AddThemeColorOverride("font_color", new Color(0.5f, 0.5f, 0.5f));
+		label2.AddThemeFontSizeOverride("font_size", 11);
+		vBoxContainer.AddChild(label2, forceReadableName: false, Node.InternalMode.Disabled);
+		_canvasLayer.AddChild(_panel, forceReadableName: false, Node.InternalMode.Disabled);
+		if (!IsPopoutMode)
+		{
+			_gripLabel = new Label();
+			_gripLabel.Text = "◢";
+			_gripLabel.AddThemeColorOverride("font_color", new Color(1f, 1f, 1f, 0.3f));
+			_gripLabel.AddThemeFontSizeOverride("font_size", 14);
+			_gripLabel.MouseFilter = Control.MouseFilterEnum.Ignore;
+			_canvasLayer.AddChild(_gripLabel, forceReadableName: false, Node.InternalMode.Disabled);
+		}
+		if (IsPopoutMode)
+		{
+			_panel.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.FullRect, Control.LayoutPresetMode.Minsize);
+			_panel.CustomMinimumSize = Vector2.Zero;
+		}
+		else if (LayoutStore.HandViewerPos.HasValue)
+		{
+			_panel.Position = LayoutStore.HandViewerPos.Value;
+		}
+		else
+		{
+			_panel.CallDeferred("set_position", GetCenteredPosition());
+		}
+		_visible = true;
+	}
+
+	private static void UpdateGripPosition()
+	{
+		if (_gripLabel != null && GodotObject.IsInstanceValid(_gripLabel) && _panel != null && GodotObject.IsInstanceValid(_panel))
+		{
+			Vector2 position = _panel.Position;
+			Vector2 size = _panel.Size;
+			_gripLabel.Position = new Vector2(position.X + size.X - 18f, position.Y + size.Y - 20f);
+		}
+	}
+
+	private static Vector2 GetCenteredPosition()
+	{
+		float num = (NGame.Instance?.GetViewport()?.GetVisibleRect().Size ?? new Vector2(1920f, 1080f)).X / 2f - 500f;
+		if (num < 0f)
+		{
+			num = 0f;
+		}
+		return new Vector2(num, 20f);
+	}
+
+	private static bool IsExclusiveFullscreen()
+	{
+		try
+		{
+			DisplayServer.WindowMode windowMode = DisplayServer.WindowGetMode();
+			return windowMode == DisplayServer.WindowMode.ExclusiveFullscreen;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private static Window BuildPopoutWindow(Node parent)
+	{
+		//IL_0193: Unknown result type (might be due to invalid IL or missing references)
+		//IL_019d: Expected O, but got Unknown
+		try
+		{
+			Window window = parent.GetTree()?.Root;
+			if (window != null)
+			{
+				_savedGuiEmbedSubwindows = window.GuiEmbedSubwindows;
+				window.GuiEmbedSubwindows = false;
+			}
+		}
+		catch (System.Exception ex)
+		{
+			ModLog.Error("DeckTracker popout embed-flag toggle", ex);
+		}
+		Window win = new Window
+		{
+			Title = "BetterSpire2 — Hand",
+			Unfocusable = true,
+			TransparentBg = false,
+			MinSize = new Vector2I(230, 180),
+			Visible = false
+		};
+		win.Size = LayoutStore.HandViewerWindowSize ?? new Vector2I(420, 480);
+		parent.AddChild(win, forceReadableName: false, Node.InternalMode.Disabled);
+		try
+		{
+			win.ForceNative = true;
+		}
+		catch (System.Exception ex2)
+		{
+			ModLog.Error("DeckTracker popout ForceNative", ex2);
+		}
+		if (LayoutStore.HandViewerWindowPos.HasValue)
+		{
+			win.Position = LayoutStore.HandViewerWindowPos.Value;
+		}
+		else
+		{
+			try
+			{
+				int screen = DisplayServer.WindowGetCurrentScreen();
+				Vector2I vector2I = DisplayServer.ScreenGetPosition(screen);
+				Vector2I vector2I2 = DisplayServer.ScreenGetSize(screen);
+				win.Position = vector2I + (vector2I2 - win.Size) / 2;
+			}
+			catch (System.Exception ex3)
+			{
+				ModLog.Error("DeckTracker popout center", ex3);
+			}
+		}
+		win.CloseRequested += (Action)delegate
+		{
+			try
+			{
+				LayoutStore.HandViewerWindowPos = win.Position;
+				LayoutStore.HandViewerWindowSize = win.Size;
+				LayoutStore.Save();
+				ModSettings.HandViewerPopout = false;
+				ModSettings.Save();
+				Hide();
+			}
+			catch (System.Exception ex4)
+			{
+				ModLog.Error("DeckTracker popout CloseRequested", ex4);
+			}
+		};
+		win.Visible = true;
+		return win;
+	}
+
+	private static Button CreateArrowButton(string text, bool enabled)
+	{
+		Button button = new Button();
+		button.Text = text;
+		button.CustomMinimumSize = new Vector2(32f, 28f);
+		button.Disabled = !enabled;
+		StyleBoxFlat styleBoxFlat = new StyleBoxFlat();
+		styleBoxFlat.BgColor = (enabled ? new Color(0.2f, 0.18f, 0.12f) : new Color(0.15f, 0.15f, 0.15f));
+		styleBoxFlat.BorderColor = (enabled ? new Color(0.8f, 0.6f, 0.2f) : new Color(0.4f, 0.4f, 0.4f));
+		styleBoxFlat.SetBorderWidthAll(1);
+		styleBoxFlat.SetCornerRadiusAll(4);
+		styleBoxFlat.SetContentMarginAll(4f);
+		button.AddThemeStyleboxOverride("normal", styleBoxFlat);
+		StyleBoxFlat styleBoxFlat2 = new StyleBoxFlat();
+		styleBoxFlat2.BgColor = new Color(0.3f, 0.25f, 0.15f);
+		styleBoxFlat2.BorderColor = new Color(0.9f, 0.7f, 0.2f);
+		styleBoxFlat2.SetBorderWidthAll(1);
+		styleBoxFlat2.SetCornerRadiusAll(4);
+		styleBoxFlat2.SetContentMarginAll(4f);
+		button.AddThemeStyleboxOverride("hover", styleBoxFlat2);
+		StyleBoxFlat styleBoxFlat3 = new StyleBoxFlat();
+		styleBoxFlat3.BgColor = new Color(0.35f, 0.3f, 0.15f);
+		styleBoxFlat3.BorderColor = new Color(1f, 0.8f, 0.3f);
+		styleBoxFlat3.SetBorderWidthAll(1);
+		styleBoxFlat3.SetCornerRadiusAll(4);
+		styleBoxFlat3.SetContentMarginAll(4f);
+		button.AddThemeStyleboxOverride("pressed", styleBoxFlat3);
+		button.AddThemeStyleboxOverride("disabled", styleBoxFlat);
+		button.AddThemeColorOverride("font_color", enabled ? new Color(0.9f, 0.7f, 0.2f) : new Color(0.4f, 0.4f, 0.4f));
+		button.AddThemeColorOverride("font_disabled_color", new Color(0.4f, 0.4f, 0.4f));
+		button.AddThemeFontSizeOverride("font_size", 16);
+		return button;
+	}
+
+	public static bool IsPointInPanel(Vector2 point)
+	{
+		if (!_visible || _panel == null || !GodotObject.IsInstanceValid(_panel))
+		{
+			return false;
+		}
+		return _panel.GetGlobalRect().HasPoint(point);
+	}
+
+	public static void Hide()
+	{
+		if (IsPopoutMode && _popoutWindow != null)
+		{
+			LayoutStore.HandViewerWindowPos = _popoutWindow.Position;
+			LayoutStore.HandViewerWindowSize = _popoutWindow.Size;
+			LayoutStore.Save();
+		}
+		else if (_panel != null && GodotObject.IsInstanceValid(_panel))
+		{
+			LayoutStore.HandViewerPos = _panel.Position;
+			LayoutStore.HandViewerSize = _panel.Size;
+			LayoutStore.Save();
+		}
+		CleanupUI();
+		_visible = false;
+		_resizing = false;
+	}
+
+	public static void SetCanvasHidden(bool hidden)
+	{
+		if (!IsPopoutMode && _canvasLayer != null && GodotObject.IsInstanceValid(_canvasLayer))
+		{
+			_canvasLayer.Visible = !hidden;
+		}
+	}
+
+	private static void CleanupUI()
+	{
+		//IL_0007: Unknown result type (might be due to invalid IL or missing references)
+		//IL_000c: Unknown result type (might be due to invalid IL or missing references)
+		var enumerator = _sections.GetEnumerator();
+		try
+		{
+			while (enumerator.MoveNext())
+			{
+				PlayerHandSection current = enumerator.Current;
+				try
+				{
+					current.Cleanup();
+				}
+				catch (System.Exception ex)
+				{
+					ModLog.Error("DeckTracker section cleanup", ex);
+				}
+			}
+		}
+		finally
+		{
+			((System.IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+		}
+		_sections.Clear();
+		if (_canvasLayer != null && GodotObject.IsInstanceValid(_canvasLayer))
+		{
+			_canvasLayer.QueueFree();
+		}
+		if (_popoutWindow != null && GodotObject.IsInstanceValid(_popoutWindow))
+		{
+			_popoutWindow.QueueFree();
+		}
+		if (_savedGuiEmbedSubwindows.HasValue)
+		{
+			try
+			{
+				Window window = NGame.Instance?.GetTree()?.Root;
+				if (window != null)
+				{
+					window.GuiEmbedSubwindows = _savedGuiEmbedSubwindows.Value;
+				}
+			}
+			catch (System.Exception ex2)
+			{
+				ModLog.Error("DeckTracker popout embed-flag restore", ex2);
+			}
+			_savedGuiEmbedSubwindows = null;
+		}
+		_canvasLayer = null;
+		_panel = null;
+		_gripLabel = null;
+		_popoutWindow = null;
+	}
+
+	internal static string ResolveDescription(object cardObj)
+	{
+		try
+		{
+			Traverse traverse = Traverse.Create(cardObj);
+			try
+			{
+				object value = traverse.Property("Pile").GetValue();
+				object obj = null;
+				if (value != null)
+				{
+					obj = Traverse.Create(value).Property("PileType").GetValue();
+				}
+				MethodInfo method = cardObj.GetType().GetMethod("GetDescriptionForPile");
+				if (method != (MethodInfo)null)
+				{
+					object obj2 = ((MethodBase)method).Invoke(cardObj, new object[2] { obj, null });
+					if (obj2 is string text && !string.IsNullOrEmpty(text))
+					{
+						return CleanDescriptionText(text);
+					}
+				}
+			}
+			catch
+			{
+			}
+			object value2 = traverse.Property("Description").GetValue();
+			if (value2 == null)
+			{
+				return "";
+			}
+			string value3 = Traverse.Create(value2).Method("GetFormattedText").GetValue<string>();
+			if (string.IsNullOrEmpty(value3))
+			{
+				return "";
+			}
+			string text2 = ResolveVarPlaceholders(cardObj, value3);
+			return CleanDescriptionText(text2);
+		}
+		catch
+		{
+			return "";
+		}
+	}
+
+	private static string CleanDescriptionText(string text)
+	{
+		//IL_001b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0020: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0026: Expected O, but got Unknown
+		string text2 = text;
+		object obj = _003C_003Ec._003C_003E9__46_0;
+		if (obj == null)
+		{
+			MatchEvaluator val = delegate(Match match)
+			{
+				int count = Regex.Matches(((Capture)match).Value, "\\[img\\]").Count;
+				Match val2 = Regex.Match(((Capture)match).Value, "res://\\S+?/([^/]+?)(?:_icon)?\\.png");
+				string filename = (((Group)val2).Success ? ((Capture)val2.Groups[1]).Value : "?");
+				filename = MapIconLabel(filename);
+				return (count > 1) ? $"{count} {filename}" : filename;
+			};
+			_003C_003Ec._003C_003E9__46_0 = val;
+			obj = (object)val;
+		}
+		text = Regex.Replace(text2, "(\\[img\\]res://\\S+?/([^/]+?)(?:_icon)?\\.png\\[/img\\])+", (MatchEvaluator)obj, (RegexOptions)1);
+		text = Regex.Replace(text, "\\[/?[^\\]]+\\]", "");
+		text = Regex.Replace(text, "res://\\S+", "");
+		return text.Trim();
+	}
+
+	private static string MapIconLabel(string filename)
+	{
+		filename = filename.ToLowerInvariant();
+		if (filename.Contains("energy"))
+		{
+			return "Energy";
+		}
+		if (filename.Contains("block"))
+		{
+			return "Block";
+		}
+		if (filename.Contains("star"))
+		{
+			return "Star";
+		}
+		if (filename.Contains("orb"))
+		{
+			return "Orb";
+		}
+		return char.ToUpper(filename[0]) + filename.Substring(1);
+	}
+
+	private static string ResolveVarPlaceholders(object cardObj, string text)
+	{
+		//IL_0041: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004b: Expected O, but got Unknown
+		object dvObj = Traverse.Create(cardObj).Property("DynamicVars").GetValue();
+		if (dvObj == null)
+		{
+			return text;
+		}
+		return Regex.Replace(text, "\\{(\\w+)(?::[^}]*)?\\}", (MatchEvaluator)delegate(Match match)
+		{
+			string value = ((Capture)match.Groups[1]).Value;
+			try
+			{
+				MethodInfo method = dvObj.GetType().GetMethod("TryGetValue");
+				if (method != (MethodInfo)null)
+				{
+					object[] array = new object[2] { value, null };
+					if ((bool)((MethodBase)method).Invoke(dvObj, array) && array[1] != null)
+					{
+						return Traverse.Create(array[1]).Property<int>("IntValue").Value.ToString();
+					}
+				}
+			}
+			catch
+			{
+			}
+			return ((Capture)match).Value;
+		});
+	}
+
+	public static void HandleMouseInput(InputEvent @event)
+	{
+		if (!_visible || _panel == null || !GodotObject.IsInstanceValid(_panel) || IsPopoutMode)
+		{
+			return;
+		}
+		UpdateGripPosition();
+		if (@event is InputEventMouseButton inputEventMouseButton && inputEventMouseButton.ButtonIndex == MouseButton.Left)
+		{
+			Vector2 position = inputEventMouseButton.Position;
+			Rect2 globalRect = _panel.GetGlobalRect();
+			if (inputEventMouseButton.Pressed)
+			{
+				if (globalRect.HasPoint(position))
+				{
+					ResizeEdge resizeEdge = GetResizeEdge(position, globalRect);
+					if (resizeEdge != ResizeEdge.None)
+					{
+						_resizing = true;
+						_resizeEdge = resizeEdge;
+					}
+					else
+					{
+						_dragging = true;
+						_dragOffset = position - _panel.Position;
+					}
+				}
+				else if (!SettingsMenu.IsPointInPanel(position) && !ModSettings.AlwaysShowTeammateHand)
+				{
+					_dragging = false;
+					_resizing = false;
+					Hide();
+				}
+			}
+			else
+			{
+				if (_dragging || _resizing)
+				{
+					LayoutStore.HandViewerPos = _panel.Position;
+					LayoutStore.HandViewerSize = _panel.Size;
+					LayoutStore.Save();
+				}
+				_dragging = false;
+				_resizing = false;
+			}
+		}
+		else
+		{
+			if (!(@event is InputEventMouseMotion inputEventMouseMotion))
+			{
+				return;
+			}
+			if (_resizing)
+			{
+				Vector2 position2 = _panel.Position;
+				Vector2 size = _panel.Size;
+				if (((System.Enum)_resizeEdge).HasFlag((System.Enum)ResizeEdge.Right))
+				{
+					size.X = Math.Max(230f, inputEventMouseMotion.Position.X - position2.X);
+				}
+				if (((System.Enum)_resizeEdge).HasFlag((System.Enum)ResizeEdge.Bottom))
+				{
+					size.Y = Math.Max(180f, inputEventMouseMotion.Position.Y - position2.Y);
+				}
+				_panel.CustomMinimumSize = size;
+				_panel.Size = size;
+			}
+			else if (_dragging)
+			{
+				_panel.Position = inputEventMouseMotion.Position - _dragOffset;
+			}
+			else
+			{
+				UpdateResizeCursor(inputEventMouseMotion.Position, _panel.GetGlobalRect());
+			}
+		}
+	}
+
+	private static ResizeEdge GetResizeEdge(Vector2 mousePos, Rect2 rect)
+	{
+		ResizeEdge resizeEdge = ResizeEdge.None;
+		if (mousePos.X >= rect.End.X - 8f)
+		{
+			resizeEdge |= ResizeEdge.Right;
+		}
+		if (mousePos.Y >= rect.End.Y - 8f)
+		{
+			resizeEdge |= ResizeEdge.Bottom;
+		}
+		return resizeEdge;
+	}
+
+	private static void UpdateResizeCursor(Vector2 mousePos, Rect2 rect)
+	{
+		if (!rect.HasPoint(mousePos))
+		{
+			_panel.MouseDefaultCursorShape = Control.CursorShape.Arrow;
+			return;
+		}
+		ResizeEdge resizeEdge = GetResizeEdge(mousePos, rect);
+		HandPanel panel = _panel;
+		if (1 == 0)
+		{
+		}
+		Control.CursorShape mouseDefaultCursorShape = resizeEdge switch
+		{
+			ResizeEdge.Right | ResizeEdge.Bottom => Control.CursorShape.Fdiagsize, 
+			ResizeEdge.Right => Control.CursorShape.Hsize, 
+			ResizeEdge.Bottom => Control.CursorShape.Vsize, 
+			_ => Control.CursorShape.Arrow, 
+		};
+		if (1 == 0)
+		{
+		}
+		panel.MouseDefaultCursorShape = mouseDefaultCursorShape;
+	}
 }

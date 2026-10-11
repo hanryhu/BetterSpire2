@@ -3,7 +3,7 @@
   "name": "BetterSpire2 Lite",
   "author": "jdr",
   "description": "QoL display mod: incoming damage totals, multi-hit labels, hand viewer, skip splash. Safe for multiplayer.",
-  "version": "v1.62",
+  "version": "v1.83.10",
   "has_pck": false,
   "has_dll": true,
   "dependencies": [],
