@@ -86,6 +86,8 @@ public static class LayoutStore
 			[CompilerGenerated]
 			set;
 		}
+
+		public float? contentOffsetY { get; set; }
 	}
 
 	public static Vector2? ClockPos;
@@ -99,6 +101,9 @@ public static class LayoutStore
 	public static Vector2I? HandViewerWindowPos;
 
 	public static Vector2I? HandViewerWindowSize;
+
+	// How far the hand viewer's content is shifted up inside the panel (hides part of the header).
+	public static float HandViewerContentOffsetY;
 
 	public static readonly Dictionary<string, Vector2> DamageOffsets = new Dictionary<string, Vector2>();
 
@@ -142,12 +147,13 @@ public static class LayoutStore
 			{
 				clockPos = ToArr(ClockPos),
 				potionPos = ToArr(PotionPos),
-				handViewer = ((HandViewerPos.HasValue || HandViewerSize.HasValue || HandViewerWindowPos.HasValue || HandViewerWindowSize.HasValue) ? new HandViewerDto
+				handViewer = ((HandViewerPos.HasValue || HandViewerSize.HasValue || HandViewerWindowPos.HasValue || HandViewerWindowSize.HasValue || HandViewerContentOffsetY != 0f) ? new HandViewerDto
 				{
 					pos = ToArr(HandViewerPos),
 					size = ToArr(HandViewerSize),
 					windowPos = ToArrI(HandViewerWindowPos),
-					windowSize = ToArrI(HandViewerWindowSize)
+					windowSize = ToArrI(HandViewerWindowSize),
+					contentOffsetY = ((HandViewerContentOffsetY != 0f) ? HandViewerContentOffsetY : null)
 				} : null),
 				damageOffsets = ((DamageOffsets.Count > 0) ? ToOffsetDict(DamageOffsets) : null)
 			};
@@ -181,6 +187,7 @@ public static class LayoutStore
 		HandViewerSize = FromArr(dto.handViewer?.size);
 		HandViewerWindowPos = FromArrI(dto.handViewer?.windowPos);
 		HandViewerWindowSize = FromArrI(dto.handViewer?.windowSize);
+		HandViewerContentOffsetY = dto.handViewer?.contentOffsetY ?? 0f;
 		DamageOffsets.Clear();
 		if (dto.damageOffsets == null)
 		{

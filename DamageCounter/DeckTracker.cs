@@ -1518,6 +1518,16 @@ public static class DeckTracker
 
 	private static Vector2 _dragOffset;
 
+	private static Control? _contentClip;
+
+	private static ScrollContainer? _contentScroll;
+
+	private static bool _offsetDragging;
+
+	private static float _offsetDragStartMouseY;
+
+	private static float _offsetDragStartValue;
+
 	private static bool IsPopoutMode => _popoutWindow != null && GodotObject.IsInstanceValid(_popoutWindow);
 
 	public static bool IsVisible => _visible;
@@ -1567,6 +1577,7 @@ public static class DeckTracker
 		LayoutStore.HandViewerSize = null;
 		LayoutStore.HandViewerWindowPos = null;
 		LayoutStore.HandViewerWindowSize = null;
+		LayoutStore.HandViewerContentOffsetY = 0f;
 		LayoutStore.Save();
 		if (visible)
 		{
@@ -1853,12 +1864,20 @@ public static class DeckTracker
 		styleBoxFlat.SetCornerRadiusAll((num4 > 0f) ? 6 : 0);
 		styleBoxFlat.SetContentMarginAll(14f);
 		_panel.AddThemeStyleboxOverride("panel", styleBoxFlat);
+		// Plain (non-container) clip control so the scroll content can be shifted up past the
+		// panel's top edge, hiding part of the header (Shift+drag adjusts the offset).
+		_contentClip = new Control();
+		_contentClip.ClipContents = true;
+		_contentClip.MouseFilter = Control.MouseFilterEnum.Ignore;
+		_contentClip.SizeFlagsVertical = Control.SizeFlags.ExpandFill;
+		_contentClip.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
+		_panel.AddChild(_contentClip, forceReadableName: false, Node.InternalMode.Disabled);
 		ScrollContainer scrollContainer = new ScrollContainer();
-		scrollContainer.SizeFlagsVertical = Control.SizeFlags.ExpandFill;
-		scrollContainer.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
 		scrollContainer.HorizontalScrollMode = ScrollContainer.ScrollMode.Disabled;
-		scrollContainer.SetAnchorsPreset(Control.LayoutPreset.FullRect);
-		_panel.AddChild(scrollContainer, forceReadableName: false, Node.InternalMode.Disabled);
+		_contentClip.AddChild(scrollContainer, forceReadableName: false, Node.InternalMode.Disabled);
+		_contentScroll = scrollContainer;
+		scrollContainer.MinimumSizeChanged += SyncContentClipMinSize;
+		ApplyContentOffset();
 		VBoxContainer vBoxContainer = new VBoxContainer();
 		vBoxContainer.AddThemeConstantOverride("separation", 6);
 		vBoxContainer.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
@@ -1982,11 +2001,11 @@ public static class DeckTracker
 		}
 		else if (ModSettings.AlwaysShowTeammateHand)
 		{
-			label2.Text = "Drag to move | Drag edges to resize | F3 or X to close";
+			label2.Text = "Drag to move | Shift+drag to shift content | Drag edges to resize | F3 or X to close";
 		}
 		else
 		{
-			label2.Text = "Drag to move | Drag edges to resize | Click outside to close";
+			label2.Text = "Drag to move | Shift+drag to shift content | Drag edges to resize | Click outside to close";
 		}
 		label2.HorizontalAlignment = HorizontalAlignment.Center;
 		label2.MouseFilter = Control.MouseFilterEnum.Ignore;
@@ -2017,6 +2036,24 @@ public static class DeckTracker
 			_panel.CallDeferred("set_position", GetCenteredPosition());
 		}
 		_visible = true;
+	}
+
+	private static void SyncContentClipMinSize()
+	{
+		if (_contentClip != null && GodotObject.IsInstanceValid(_contentClip) && _contentScroll != null && GodotObject.IsInstanceValid(_contentScroll))
+		{
+			// Keep the panel at least as wide as its content, as when the scroll container was its direct child.
+			_contentClip.CustomMinimumSize = new Vector2(_contentScroll.GetCombinedMinimumSize().X, 0f);
+		}
+	}
+
+	private static void ApplyContentOffset()
+	{
+		if (_contentScroll != null && GodotObject.IsInstanceValid(_contentScroll))
+		{
+			_contentScroll.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.FullRect);
+			_contentScroll.OffsetTop = 0f - LayoutStore.HandViewerContentOffsetY;
+		}
 	}
 
 	private static void UpdateGripPosition()
@@ -2246,8 +2283,11 @@ public static class DeckTracker
 		}
 		_canvasLayer = null;
 		_panel = null;
+		_contentClip = null;
+		_contentScroll = null;
 		_gripLabel = null;
 		_popoutWindow = null;
+		_offsetDragging = false;
 	}
 
 	internal static string ResolveDescription(object cardObj)
@@ -2395,6 +2435,12 @@ public static class DeckTracker
 						_resizing = true;
 						_resizeEdge = resizeEdge;
 					}
+					else if (inputEventMouseButton.ShiftPressed)
+					{
+						_offsetDragging = true;
+						_offsetDragStartMouseY = position.Y;
+						_offsetDragStartValue = LayoutStore.HandViewerContentOffsetY;
+					}
 					else
 					{
 						_dragging = true;
@@ -2410,7 +2456,7 @@ public static class DeckTracker
 			}
 			else
 			{
-				if (_dragging || _resizing)
+				if (_dragging || _resizing || _offsetDragging)
 				{
 					LayoutStore.HandViewerPos = _panel.Position;
 					LayoutStore.HandViewerSize = _panel.Size;
@@ -2418,6 +2464,7 @@ public static class DeckTracker
 				}
 				_dragging = false;
 				_resizing = false;
+				_offsetDragging = false;
 			}
 		}
 		else
@@ -2440,6 +2487,13 @@ public static class DeckTracker
 				}
 				_panel.CustomMinimumSize = size;
 				_panel.Size = size;
+			}
+			else if (_offsetDragging)
+			{
+				// Dragging up shifts content up (hiding more of the header); keep at least 20px of content visible.
+				float max = (_contentClip != null && GodotObject.IsInstanceValid(_contentClip)) ? Math.Max(0f, _contentClip.Size.Y - 20f) : 0f;
+				LayoutStore.HandViewerContentOffsetY = Math.Clamp(_offsetDragStartValue - (inputEventMouseMotion.Position.Y - _offsetDragStartMouseY), 0f, max);
+				ApplyContentOffset();
 			}
 			else if (_dragging)
 			{
